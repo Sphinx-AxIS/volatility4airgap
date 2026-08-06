@@ -240,6 +240,11 @@ def directory_stats(root: Path) -> tuple[int, int]:
 
 
 MANIFEST_NAME = "BUILD-MANIFEST.json"
+FILELIST_NAME = "BUILD-FILES.sha256"
+
+#: Excluded from the payload digest because they record it. Including either would
+#: be circular: writing the digest would change the value it describes.
+_DIGEST_EXCLUDED = frozenset({MANIFEST_NAME, FILELIST_NAME})
 
 
 def payload_digest(root: Path) -> str:
@@ -255,11 +260,30 @@ def payload_digest(root: Path) -> str:
     digest = hashlib.sha256()
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
         relative = path.relative_to(root).as_posix()
-        if relative == MANIFEST_NAME:
+        if relative in _DIGEST_EXCLUDED:
             continue
         digest.update(relative.encode("utf-8") + b"\0")
         digest.update(sha256_file(path).encode("ascii") + b"\0")
     return digest.hexdigest()
+
+
+def write_file_list(root: Path) -> Path:
+    """Per-file digests, so a mismatch can name the offending file.
+
+    An aggregate digest only says "something changed"; the analyst still has to
+    find what. Standard ``sha256sum`` format, so it is also checkable with other
+    tools if ours will not start.
+    """
+    lines = []
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        relative = path.relative_to(root).as_posix()
+        if relative in _DIGEST_EXCLUDED:
+            continue
+        lines.append(f"{sha256_file(path)}  {relative}")
+
+    destination = root / FILELIST_NAME
+    destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return destination
 
 
 def check_bundle(bundle: Path) -> int:
@@ -379,7 +403,9 @@ def build(args: argparse.Namespace) -> Path:
         "contents": {"files": file_count, "bytes": total_bytes},
         # Stable across rebuilds; built_utc above is not.
         "payload_sha256": payload_digest(bundle),
+        "file_list": FILELIST_NAME,
     }
+    write_file_list(bundle)
     (bundle / MANIFEST_NAME).write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
     )

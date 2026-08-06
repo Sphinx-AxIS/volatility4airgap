@@ -289,6 +289,73 @@ def cmd_fetch_symbols(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+FILELIST_NAME = "BUILD-FILES.sha256"
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    """Verify every bundled file against the digests recorded at build time.
+
+    Exists because a corrupted bundle otherwise surfaces as an arbitrary downstream
+    error — a replaced v4ag.bat reports '{' is not recognized as a command, which
+    names nothing useful. Media carried between machines is exactly where silent
+    corruption happens, so this must be answerable on the air-gapped host itself.
+    """
+    import hashlib
+
+    filelist = BUNDLE_ROOT / FILELIST_NAME
+    if not filelist.is_file():
+        print(f"error: {FILELIST_NAME} not found; this is not a built bundle",
+              file=sys.stderr)
+        return 2
+
+    expected: dict[str, str] = {}
+    for line in filelist.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        digest, _, relative = line.partition("  ")
+        expected[relative] = digest
+
+    modified, missing = [], []
+    for relative, digest in sorted(expected.items()):
+        path = BUNDLE_ROOT.joinpath(*relative.split("/"))
+        if not path.is_file():
+            missing.append(relative)
+            continue
+        actual = hashlib.sha256()
+        try:
+            with open(path, "rb") as handle:
+                for block in iter(lambda: handle.read(1 << 20), b""):
+                    actual.update(block)
+        except OSError as exc:
+            modified.append(f"{relative} (unreadable: {exc})")
+            continue
+        if actual.hexdigest() != digest:
+            modified.append(relative)
+
+    print(f"Checked {len(expected)} file(s) against {FILELIST_NAME}")
+    print(f"  build   {build_identity()}")
+
+    if not modified and not missing:
+        print("\nBundle intact.")
+        return 0
+
+    if modified:
+        print(f"\nMODIFIED ({len(modified)}):")
+        for name in modified[:20]:
+            print(f"  {name}")
+        if len(modified) > 20:
+            print(f"  ... and {len(modified) - 20} more")
+    if missing:
+        print(f"\nMISSING ({len(missing)}):")
+        for name in missing[:20]:
+            print(f"  {name}")
+        if len(missing) > 20:
+            print(f"  ... and {len(missing) - 20} more")
+
+    print("\nRe-extract the bundle to a clean folder.")
+    return 1
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     document = symbol_request.load(Path(args.request).expanduser())
     symbols_dir = Path(args.symbols).expanduser() if args.symbols else default_symbols_dir()
@@ -406,7 +473,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 #: Listed by doctor so a stale extract is obvious at a glance.
-_COMMANDS = ("triage", "symbols", "fetch-symbols", "verify", "doctor")
+_COMMANDS = ("triage", "symbols", "fetch-symbols", "verify", "doctor", "check")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -477,6 +544,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--all", action="store_true", help="refetch every kernel, not only the missing"
     )
     fetch_cmd.set_defaults(func=cmd_fetch_symbols)
+
+    check = sub.add_parser("check", help="verify bundled files against their build digests")
+    check.set_defaults(func=cmd_check)
 
     doctor = sub.add_parser("doctor", help="report bundle health and import status")
     doctor.add_argument("--symbols", default=None, help="symbols directory")

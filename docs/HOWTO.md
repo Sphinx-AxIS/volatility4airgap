@@ -128,6 +128,33 @@ a second trip.
 | `REQUEST` | *required* | Path to `symbol_request.json` |
 | `--symbols DIR` | `symbols\` | Symbols folder to check |
 
+### `check` — verify the bundle is intact
+
+Recomputes a SHA-256 for every bundled file and compares it with `BUILD-FILES.sha256`,
+written at build time. Names any file that was modified or is missing.
+
+Run it after copying the bundle between machines, and whenever anything behaves
+inexplicably. Corruption on removable media is silent, and shows up as an unrelated
+error somewhere downstream — a damaged `v4ag.bat` reports `'{' is not recognized as an
+internal or external command`, which points nowhere useful.
+
+Takes no options. Files you have added — symbols, output — are ignored; only what shipped
+in the bundle is checked.
+
+```bat
+v4ag.bat check
+```
+
+```
+Checked 1047 file(s) against BUILD-FILES.sha256
+  build   built 2026-08-06T05:19:34+00:00, payload 38905d41
+
+MODIFIED (1):
+  v4ag.bat
+
+Re-extract the bundle to a clean folder.
+```
+
 ### `doctor` — check the bundle
 
 Reports build identity, interpreter architecture, `sys.path`, and whether every required
@@ -369,14 +396,22 @@ The tool also prints a `.pd_` fallback URL; that variant is a Microsoft cabinet 
 The image is probably on slow or removable media. Every plugin streams the whole image, so
 workers contend. Drop back to `--jobs 1`, or copy the image to local disk first.
 
+**A command prints gibberish, or `'{' is not recognized as an internal or external command`**
+A bundled file is corrupt — most likely `v4ag.bat` itself. Run `v4ag.bat check`, which
+names the offending file. If `v4ag.bat` is the damaged one it cannot check itself, so
+re-extract the bundle to a clean folder.
+
 **Something is wrong and I do not know what**
 
 ```bat
-v4ag.bat doctor
+v4ag.bat check     :: are the files intact?
+v4ag.bat doctor    :: does everything import?
 ```
 
-It reports the build, the interpreter architecture, every `sys.path` entry, and whether
-each required component imports.
+`check` verifies every bundled file against its build-time digest. `doctor` reports the
+build, the interpreter architecture, every `sys.path` entry, and whether each required
+component imports. Between them they cover corrupt files, stale extracts, wrong
+architecture and missing components.
 
 ---
 

@@ -252,3 +252,79 @@ class TestBuildIdentity:
             action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
         ][0]
         assert set(subparsers.choices) == set(cli._COMMANDS)
+
+
+class TestCheckCommand:
+    """Bundle integrity, answerable on the air-gapped host itself.
+
+    Without this a corrupt bundle surfaces as an arbitrary downstream error — a
+    replaced v4ag.bat reports "'{' is not recognized as a command", which names
+    nothing useful.
+    """
+
+    def _bundle(self, tmp_path, monkeypatch):
+        import hashlib
+
+        import app.__main__ as cli
+
+        root = tmp_path / "bundle"
+        (root / "app").mkdir(parents=True)
+        files = {"v4ag.bat": b"@echo off\n", "app/symbols.py": b"# code\n"}
+        for name, content in files.items():
+            (root / name).write_bytes(content)
+
+        lines = [
+            f"{hashlib.sha256(content).hexdigest()}  {name}"
+            for name, content in sorted(files.items())
+        ]
+        (root / cli.FILELIST_NAME).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        monkeypatch.setattr(cli, "BUNDLE_ROOT", root)
+        return root
+
+    def test_accepts_an_intact_bundle(self, tmp_path, monkeypatch, capsys) -> None:
+        self._bundle(tmp_path, monkeypatch)
+        assert main(["check"]) == 0
+        assert "Bundle intact" in capsys.readouterr().out
+
+    def test_names_a_modified_file(self, tmp_path, monkeypatch, capsys) -> None:
+        """The whole point: say which file, not merely that something changed."""
+        root = self._bundle(tmp_path, monkeypatch)
+        (root / "v4ag.bat").write_bytes(b'{\n  "symbols": {},\n')
+
+        assert main(["check"]) == 1
+        out = capsys.readouterr().out
+        assert "MODIFIED" in out
+        assert "v4ag.bat" in out
+        assert "app/symbols.py" not in out.split("MODIFIED")[1]
+
+    def test_names_a_missing_file(self, tmp_path, monkeypatch, capsys) -> None:
+        root = self._bundle(tmp_path, monkeypatch)
+        (root / "app" / "symbols.py").unlink()
+
+        assert main(["check"]) == 1
+        out = capsys.readouterr().out
+        assert "MISSING" in out and "app/symbols.py" in out
+
+    def test_reports_both_at_once(self, tmp_path, monkeypatch, capsys) -> None:
+        root = self._bundle(tmp_path, monkeypatch)
+        (root / "v4ag.bat").write_bytes(b"tampered")
+        (root / "app" / "symbols.py").unlink()
+
+        assert main(["check"]) == 1
+        out = capsys.readouterr().out
+        assert "MODIFIED" in out and "MISSING" in out
+
+    def test_an_untracked_extra_file_is_ignored(self, tmp_path, monkeypatch) -> None:
+        """Analysts drop symbols and outputs into the bundle; that is not corruption."""
+        root = self._bundle(tmp_path, monkeypatch)
+        (root / "symbols").mkdir()
+        (root / "symbols" / "extra.json.xz").write_bytes(b"new")
+
+        assert main(["check"]) == 0
+
+    def test_reports_a_bundle_without_a_file_list(self, tmp_path, monkeypatch, capsys) -> None:
+        import app.__main__ as cli
+
+        monkeypatch.setattr(cli, "BUNDLE_ROOT", tmp_path)
+        assert main(["check"]) == 2
+        assert "not a built bundle" in capsys.readouterr().err
