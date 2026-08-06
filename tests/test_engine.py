@@ -104,3 +104,53 @@ class TestSelection:
 
     def test_find_binary_returns_none_when_absent(self, tmp_path) -> None:
         assert engine_mod.find_binary(tmp_path) is None
+
+
+class TestSwapLayers:
+    """Windows pages memory out; --single-swap-locations reads it back.
+
+    The option takes nargs='*', so its position is load-bearing: placed
+    immediately before the plugin name, argparse consumes the plugin as a swap
+    path and Volatility runs with no plugin at all.
+    """
+
+    def test_swap_paths_are_passed(self, lib, tmp_path) -> None:
+        argv = lib.command(
+            tmp_path / "i", "p", "csv", swap_files=[tmp_path / "pagefile.sys"]
+        )
+        assert "--single-swap-locations" in argv
+        assert str(tmp_path / "pagefile.sys") in argv
+
+    def test_several_swap_files_are_supported(self, lib, tmp_path) -> None:
+        argv = lib.command(
+            tmp_path / "i", "p", "csv",
+            swap_files=[tmp_path / "pagefile.sys", tmp_path / "swapfile.sys"],
+        )
+        start = argv.index("--single-swap-locations")
+        assert argv[start + 1 : start + 3] == [
+            str(tmp_path / "pagefile.sys"), str(tmp_path / "swapfile.sys")
+        ]
+
+    def test_the_plugin_is_never_adjacent_to_the_swap_list(self, lib, tmp_path) -> None:
+        """The regression this ordering exists to prevent."""
+        argv = lib.command(
+            tmp_path / "i", "windows.pslist.PsList", "csv",
+            swap_files=[tmp_path / "pagefile.sys"],
+        )
+        assert argv[-1] == "windows.pslist.PsList"
+        swap_index = argv.index("--single-swap-locations")
+        assert swap_index < len(argv) - 2
+        # An option must terminate the nargs='*' list before the plugin.
+        following = argv[swap_index + 1 :]
+        assert any(token.startswith("-") for token in following)
+
+    def test_absent_when_no_pagefile_given(self, lib, tmp_path) -> None:
+        assert "--single-swap-locations" not in lib.command(tmp_path / "i", "p", "csv")
+
+    def test_the_binary_engine_supports_it_too(self, tmp_path) -> None:
+        exe = tmp_path / "volatility3.exe"
+        exe.write_bytes(b"MZ")
+        argv = engine_mod.BinaryEngine(exe).command(
+            tmp_path / "i", "p", "csv", swap_files=[tmp_path / "pagefile.sys"]
+        )
+        assert "--single-swap-locations" in argv

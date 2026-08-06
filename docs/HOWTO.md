@@ -123,6 +123,7 @@ The main command.
 | `--out DIR` | `output\<image>` | Where results go |
 | `--symbols DIR` | `symbols\` | Where to look for ISF symbol files |
 | `--timeout SECONDS` | `3600` | Per-plugin limit before the process is killed |
+| `--pagefile PATH` | none | Include a pagefile as a swap layer; repeat for several |
 | `--no-hash` | off | Skip the custody SHA-256 of the image |
 | `--force` | off | Run even if symbols are missing or the probe fails |
 | `--output PATH` | cwd | Where to write `symbol_request.json` if symbols are missing |

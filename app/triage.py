@@ -34,6 +34,7 @@ class TriagePlan:
     formats: list[str]
     jobs: int = 1
     timeout: float = 3600.0
+    pagefiles: list[Path] = field(default_factory=list)
 
     def ensure_directories(self) -> None:
         """Create the directories a run writes into.
@@ -110,6 +111,7 @@ def build_tasks(plan: TriagePlan, engine: VolEngine) -> list[scheduler.Task]:
                         fmt,
                         symbols_dir=plan.symbols_dir,
                         cache_dir=plan.cache_dir,
+                        swap_files=plan.pagefiles,
                     ),
                     stdout_path=output_path(plan.output_dir, plugin, fmt),
                     stderr_path=log_path(plan.output_dir, plugin, fmt),
@@ -130,6 +132,7 @@ def run_probe(plan: TriagePlan, engine: VolEngine, *, log=print) -> scheduler.Ta
             "json",
             symbols_dir=plan.symbols_dir,
             cache_dir=plan.cache_dir,
+            swap_files=plan.pagefiles,
         ),
         stdout_path=probe_dir / "probe.json",
         stderr_path=probe_dir / "probe.log",
@@ -297,6 +300,7 @@ def write_manifest(
         kernels=kernels,
         engine_name=engine.name,
         jobs=plan.jobs,
+        pagefiles=plan.pagefiles,
         output_dir=plan.output_dir,
         plugin_records=plugin_records(outcomes),
         started_utc=started_utc,

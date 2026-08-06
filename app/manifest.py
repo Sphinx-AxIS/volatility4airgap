@@ -38,6 +38,7 @@ def build(
     kernels: list,
     engine_name: str,
     jobs: int,
+    pagefiles: list | None = None,
     output_dir: Path,
     plugin_records: list[dict],
     started_utc: str,
@@ -76,6 +77,16 @@ def build(
             "sha256": image_sha256,
         },
         "kernels": [k.as_dict() for k in kernels],
+        # Hashed like the image: a pagefile contributes to the findings, so it
+        # belongs in the custody record.
+        "pagefiles": [
+            {
+                "path": str(p),
+                "size_bytes": p.stat().st_size if p.exists() else None,
+                "sha256": sha256_file(p) if p.exists() else None,
+            }
+            for p in (pagefiles or [])
+        ],
         "engine": engine_name,
         "jobs": jobs,
         "plugins": plugin_records,

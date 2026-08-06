@@ -48,11 +48,21 @@ class VolEngine(ABC):
         cache_dir: Path | None = None,
         offline: bool = True,
         parallelism: str | None = "off",
+        swap_files: list[Path] | None = None,
     ) -> list[str]:
         if renderer not in RENDERERS:
             raise ValueError(f"unknown renderer {renderer!r}")
 
-        argv = [*self.base_command(), "-q", "-f", str(image), "-r", RENDERERS[renderer]]
+        argv = list(self.base_command())
+
+        # --single-swap-locations takes nargs='*', so anything following it is
+        # consumed until the next option. It must never sit immediately before the
+        # plugin name or the plugin is swallowed as a swap path. Emitting it first,
+        # with -q straight after, bounds the list.
+        if swap_files:
+            argv += ["--single-swap-locations", *[str(p) for p in swap_files]]
+
+        argv += ["-q", "-f", str(image), "-r", RENDERERS[renderer]]
 
         if symbols_dir is not None:
             argv += ["-s", str(symbols_dir)]

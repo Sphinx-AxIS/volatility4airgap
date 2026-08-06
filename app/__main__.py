@@ -204,7 +204,16 @@ def cmd_triage(args: argparse.Namespace) -> int:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    pagefiles = []
+    for raw in args.pagefile or []:
+        candidate = Path(raw).expanduser()
+        if not candidate.is_file():
+            print(f"error: pagefile not found: {candidate}", file=sys.stderr)
+            return 2
+        pagefiles.append(candidate)
+
     plan = triage.TriagePlan(
+        pagefiles=pagefiles,
         image=image,
         output_dir=output_dir,
         symbols_dir=symbols_dir,
@@ -222,6 +231,8 @@ def cmd_triage(args: argparse.Namespace) -> int:
     print(f"\nEngine {engine.name}, {len(plugin_names)} plugin(s), "
           f"formats {'+'.join(formats)}, jobs {jobs}")
     print(f"Output {output_dir}")
+    for pagefile in pagefiles:
+        print(f"Swap   {pagefile} ({pagefile.stat().st_size / 1e9:.2f} GB)")
 
     started = manifest.utc_now()
 
@@ -549,6 +560,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     triage_cmd.add_argument(
         "--no-hash", action="store_true", help="skip the custody SHA-256"
+    )
+    triage_cmd.add_argument(
+        "--pagefile", action="append", default=None, metavar="PATH",
+        help="pagefile.sys to include as a swap layer; repeat for several",
     )
     triage_cmd.add_argument(
         "--force", action="store_true",
