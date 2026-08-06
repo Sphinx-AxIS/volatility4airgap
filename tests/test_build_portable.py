@@ -209,11 +209,22 @@ class TestPinnedConstants:
         assert len(bp.PYTHON_SHA256) == 64
         assert all(c in "0123456789abcdef" for c in bp.PYTHON_SHA256)
 
-    def test_pth_exposes_lib_and_app(self) -> None:
+    def test_pth_exposes_lib_and_the_bundle_root(self) -> None:
         """The embeddable distribution ignores PYTHONPATH, so ._pth is the only route."""
-        assert "..\\lib" in bp.PTH_CONTENTS
-        assert "..\\app" in bp.PTH_CONTENTS
+        lines = [ln.strip() for ln in bp.PTH_CONTENTS.splitlines()]
+
         assert bp.PTH_CONTENTS.startswith(f"python{bp.PYTHON_TAG}.zip")
+        assert "..\\lib" in lines, "lib/ must be on the path so `import volatility3` works"
+        assert ".." in lines, "the bundle root must be on the path so `-m app` works"
+
+    def test_pth_does_not_list_the_app_package_directory(self) -> None:
+        """Regression: listing ..\\app broke `-m app` with 'No module named app'.
+
+        `-m` imports app as a package, so its parent must be on sys.path. Pointing at
+        the package directory itself exposes the modules inside while leaving the
+        package unimportable, and breaks app/'s relative imports too.
+        """
+        assert "..\\app" not in [ln.strip() for ln in bp.PTH_CONTENTS.splitlines()]
 
     def test_target_is_windows_x64(self) -> None:
         assert bp.TARGET_PLATFORM == "win_amd64"
@@ -221,3 +232,58 @@ class TestPinnedConstants:
     def test_launcher_uses_the_bundled_interpreter(self) -> None:
         assert "%~dp0python\\python.exe" in bp.LAUNCHER_BAT
         assert "-m app" in bp.LAUNCHER_BAT
+
+
+class TestDashMSemantics:
+    """Why the ._pth must name the bundle root rather than the package directory.
+
+    Asserting on the ._pth string alone would only encode the conclusion. These run
+    the interpreter to demonstrate the rule itself, and are platform-independent
+    because `-m` behaves the same everywhere.
+    """
+
+    @staticmethod
+    def _package(tmp_path):
+        root = tmp_path / "bundle"
+        pkg = root / "app"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("VALUE = 'from package'\n")
+        (pkg / "__main__.py").write_text("from . import VALUE\nprint(VALUE)\n")
+        return root, pkg
+
+    @staticmethod
+    def _run(path_entry, cwd):
+        import os
+        import subprocess
+        import sys
+
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(path_entry)
+        return subprocess.run(
+            [sys.executable, "-m", "app"],
+            cwd=str(cwd),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_parent_directory_on_path_works(self, tmp_path) -> None:
+        root, _ = self._package(tmp_path)
+        neutral = tmp_path / "elsewhere"
+        neutral.mkdir()
+
+        result = self._run(root, neutral)
+
+        assert result.returncode == 0, result.stderr
+        assert "from package" in result.stdout
+
+    def test_package_directory_on_path_fails(self, tmp_path) -> None:
+        """Exactly the failure seen on the first Windows smoke test."""
+        _, pkg = self._package(tmp_path)
+        neutral = tmp_path / "elsewhere"
+        neutral.mkdir()
+
+        result = self._run(pkg, neutral)
+
+        assert result.returncode != 0
+        assert "No module named app" in result.stderr

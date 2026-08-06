@@ -56,10 +56,16 @@ SYMBOL_PACK_URL = "https://downloads.volatilityfoundation.org/volatility3/symbol
 # The embeddable distribution ignores PYTHONPATH and the registry when a ._pth file
 # is present, so every path the bundle needs must be listed here. Paths resolve
 # relative to the directory holding python.exe.
+#
+# Note ".." — the bundle root — and not "..\app". `python -m app` imports app as a
+# package, which requires its *parent* on sys.path. Listing the package directory
+# itself makes the modules inside it visible while the package remains invisible,
+# and would also break the relative imports in app/. `..\lib` is different: there we
+# genuinely want lib/ on the path so `import volatility3` resolves.
 PTH_CONTENTS = f"""python{PYTHON_TAG}.zip
 .
+..
 ..\\lib
-..\\app
 import site
 """
 

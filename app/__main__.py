@@ -106,6 +106,88 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+#: Modules the bundle must be able to import. The native ones are easy to lose when
+#: assembling a bundle by hand: without _lzma no .json.xz symbol file can be read,
+#: and without _sqlite3 Volatility's symbol cache fails.
+_REQUIRED = [
+    ("volatility3", "the analysis engine"),
+    ("pefile", "PE parsing, required by volatility3"),
+    ("lzma", "reads .json.xz symbol files"),
+    ("sqlite3", "volatility symbol cache"),
+    ("ssl", "HTTPS for fetch-symbols"),
+    ("hashlib", "custody hashing"),
+]
+_OPTIONAL = [
+    ("yara", "yara scanning plugins"),
+    ("capstone", "disassembly plugins"),
+    ("Crypto", "hashdump and lsadump"),
+    ("PIL", "screenshot plugins"),
+]
+
+
+def _probe(name: str) -> tuple[bool, str]:
+    try:
+        module = __import__(name)
+    except Exception as exc:  # noqa: BLE001 - report anything, never crash the doctor
+        return False, f"{type(exc).__name__}: {exc}"
+    version = getattr(module, "__version__", "") or ""
+    return True, str(version)
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Report the bundle's health. Written for a host with no debugger and no network."""
+    import platform
+
+    print("Volatility4AirGap doctor")
+    print(f"  tool          {__version__}")
+    print(f"  python        {platform.python_version()} ({platform.architecture()[0]})")
+    print(f"  machine       {platform.machine()}")
+    print(f"  executable    {sys.executable}")
+    print(f"  bundle root   {BUNDLE_ROOT}")
+
+    print("\nsys.path")
+    for entry in sys.path:
+        marker = "ok " if entry and Path(entry).exists() else "   "
+        print(f"  [{marker}] {entry or '(empty)'}")
+
+    failures = 0
+    print("\nrequired")
+    for name, why in _REQUIRED:
+        ok, detail = _probe(name)
+        if not ok:
+            failures += 1
+        status = "ok     " if ok else "FAILED "
+        print(f"  [{status}] {name:14s} {detail or why}")
+
+    print("\noptional")
+    for name, why in _OPTIONAL:
+        ok, detail = _probe(name)
+        print(f"  [{'ok     ' if ok else 'absent '}] {name:14s} {detail or why}")
+
+    symbols_dir = Path(args.symbols).expanduser() if args.symbols else default_symbols_dir()
+    print(f"\nsymbols  {symbols_dir}")
+    if symbols_dir.is_dir():
+        packs = sorted(symbols_dir.rglob("*.zip"))
+        loose = sorted(symbols_dir.rglob("*.json.xz"))
+        for pack in packs:
+            print(f"  pack   {pack.name} ({pack.stat().st_size / 1e6:.0f} MB)")
+        print(f"  loose  {len(loose)} ISF file(s)")
+        if not packs and not loose:
+            print("  empty — run 'symbols' against an image to find out what is needed")
+    else:
+        print("  missing")
+
+    exe = BUNDLE_ROOT / "volatility3.exe"
+    print(f"\nvolatility3.exe  {'present' if exe.is_file() else 'not bundled'}")
+
+    if failures:
+        print(f"\n{failures} required component(s) unavailable.")
+        return 1
+
+    print("\nAll required components present.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="v4ag", description="Portable Volatility3 triage for air-gapped hosts"
@@ -128,6 +210,10 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("request", help="path to symbol_request.json")
     verify.add_argument("--symbols", default=None, help="symbols directory")
     verify.set_defaults(func=cmd_verify)
+
+    doctor = sub.add_parser("doctor", help="report bundle health and import status")
+    doctor.add_argument("--symbols", default=None, help="symbols directory")
+    doctor.set_defaults(func=cmd_doctor)
 
     return parser
 
