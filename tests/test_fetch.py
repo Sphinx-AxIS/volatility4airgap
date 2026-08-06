@@ -277,3 +277,38 @@ class TestStrippedPdbDetection:
         assert not result.ok
         assert "no type information" in result.error
         assert not kernel.isf_path(out).exists()
+
+
+class TestModuleIsfsNeedOnlySymbols:
+    """Usability depends on the role the module plays.
+
+    netstat reads tcpip's structures from JSON shipped inside volatility and uses
+    tcpip.pdb only for symbol addresses such as TcpPortPool. Requiring types of a
+    module ISF rejects symbols that work perfectly well — which is what happened
+    to a real tcpip.pdb (1667 symbols, 0 user_types) and cryptdll.pdb.
+    """
+
+    def test_a_stripped_module_isf_is_accepted(self, tmp_path) -> None:
+        tcpip = KernelPdb("tcpip.pdb", "9546A8399BAC4717BC41758594EF0D9C", 2)
+        path = write_isf(
+            tcpip.isf_path(tmp_path),
+            guid=tcpip.guid, age=tcpip.age, database=tcpip.pdb_name,
+            symbols={f"sym{i}": {} for i in range(1667)},
+            user_types={},
+        )
+        assert fetch.verify_isf(path, tcpip) == 1667
+
+    def test_a_stripped_kernel_isf_is_still_rejected(self, tmp_path, kernel) -> None:
+        path = write_isf(kernel.isf_path(tmp_path), user_types={})
+        with pytest.raises(fetch.FetchError, match="no type information"):
+            fetch.verify_isf(path, kernel)
+
+    def test_a_module_isf_with_no_symbols_is_rejected(self, tmp_path) -> None:
+        tcpip = KernelPdb("tcpip.pdb", GOLDEN_GUID, 2)
+        path = write_isf(
+            tcpip.isf_path(tmp_path),
+            guid=tcpip.guid, age=tcpip.age, database=tcpip.pdb_name,
+            symbols={}, user_types={},
+        )
+        with pytest.raises(fetch.FetchError, match="no symbols at all"):
+            fetch.verify_isf(path, tcpip)

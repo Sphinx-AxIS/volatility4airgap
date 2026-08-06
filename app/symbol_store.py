@@ -16,14 +16,17 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from .symbols import KernelPdb
+from .symbols import KernelPdb, is_kernel
 
-#: An ISF with no user_types has symbol addresses but no structure definitions.
-#: Volatility cannot build a kernel symbol table from one, so it must not count as
-#: available — otherwise the tool reports "ready to run plugins" and every plugin
-#: then fails with an error that names a requirement rather than a cause.
-def isf_has_types(path: Path) -> bool:
-    """Whether a loose ISF carries the type information Volatility needs."""
+def isf_is_usable(path: Path, pdb_name: str) -> bool:
+    """Whether a loose ISF can actually serve the role its module is needed for.
+
+    A kernel ISF must define types — Volatility resolves _EPROCESS from it, and a
+    stripped PDB produces one with the right identity that cannot build a symbol
+    table. A module ISF is used only for symbol addresses (netstat reads tcpip's
+    structures from JSON shipped inside volatility), so a stripped module PDB is
+    perfectly usable and must not be rejected.
+    """
     import json
     import lzma
 
@@ -31,9 +34,12 @@ def isf_has_types(path: Path) -> bool:
         opener = lzma.open if path.suffix == ".xz" else open
         with opener(path, "rt", encoding="utf-8") as handle:
             document = json.load(handle)
-    except Exception:  # noqa: BLE001 - unreadable is as unusable as type-less
+    except Exception:  # noqa: BLE001 - unreadable is as unusable as empty
         return False
-    return bool(document.get("user_types"))
+
+    if is_kernel(pdb_name):
+        return bool(document.get("user_types"))
+    return bool(document.get("symbols"))
 
 
 @dataclass(frozen=True)
@@ -91,11 +97,13 @@ class SymbolStore:
         """Return where this kernel's ISF lives, or ``None`` if it is absent."""
         loose = kernel.isf_path(self.root)
         if loose.is_file():
-            if not isf_has_types(loose):
-                return Located(
-                    kernel, loose, usable=False,
-                    reason="contains no type information (stripped PDB); unusable",
+            if not isf_is_usable(loose, kernel.pdb_name):
+                reason = (
+                    "contains no type information (stripped PDB); unusable"
+                    if is_kernel(kernel.pdb_name)
+                    else "contains no symbols; unusable"
                 )
+                return Located(kernel, loose, usable=False, reason=reason)
             return Located(kernel, loose)
 
         filename = kernel.isf_relative_path.rsplit("/", 1)[-1]

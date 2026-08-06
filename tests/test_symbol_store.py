@@ -191,3 +191,31 @@ class TestUsability:
         path.write_bytes(b"not lzma")
 
         assert not SymbolStore(tmp_path).has(kernel)
+
+
+class TestModuleUsability:
+    """A stripped module ISF is usable; a stripped kernel ISF is not."""
+
+    def test_a_module_isf_without_types_counts_as_available(self, tmp_path) -> None:
+        import json
+        import lzma
+
+        tcpip = KernelPdb("tcpip.pdb", GOLDEN_GUID, 2)
+        path = tcpip.isf_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with lzma.open(path, "wt") as handle:
+            json.dump(
+                {
+                    "metadata": {"windows": {"pdb": {
+                        "GUID": tcpip.guid, "age": tcpip.age, "database": tcpip.pdb_name}}},
+                    "symbols": {"TcpPortPool": {"address": 4096}},
+                    "user_types": {},
+                },
+                handle,
+            )
+
+        assert SymbolStore(tmp_path).has(tcpip)
+
+    def test_a_kernel_isf_without_types_does_not(self, tmp_path, kernel) -> None:
+        write_loose_isf(tmp_path, kernel, with_types=False)
+        assert not SymbolStore(tmp_path).has(kernel)

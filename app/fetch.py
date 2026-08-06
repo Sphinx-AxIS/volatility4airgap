@@ -27,7 +27,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from .symbols import KernelPdb
+from .symbols import KernelPdb, is_kernel
 
 # Some Microsoft endpoints reject the default urllib agent.
 USER_AGENT = "Microsoft-Symbol-Server/10.0.0.0"
@@ -180,23 +180,37 @@ def verify_isf(path: Path, kernel: KernelPdb) -> int:
             "Volatility's cache lookup would miss this file."
         )
 
-    # Identity is not usability. Microsoft serves public (stripped) PDBs for some
-    # kernels — chiefly older ones — which carry symbol addresses but no structure
-    # definitions. The resulting ISF has the right GUID and age and is useless:
-    # Volatility cannot resolve _EPROCESS and fails with "Unable to validate the
-    # plugin requirements: ['plugins.Info.kernel.symbol_table_name']", which points
-    # nowhere near the cause.
-    if not isf.get("user_types"):
+    # Identity is not usability, but what "usable" means depends on the module.
+    #
+    # A *kernel* ISF must carry type definitions: Volatility resolves _EPROCESS and
+    # friends from it, and a stripped PDB yields an ISF with the right GUID and age
+    # that fails with "Unable to validate the plugin requirements:
+    # ['plugins.Info.kernel.symbol_table_name']" — a message pointing nowhere near
+    # the cause.
+    #
+    # A *module* ISF is used differently. netstat, for instance, takes tcpip's
+    # structures from JSON shipped inside volatility and uses tcpip.pdb only for
+    # symbol addresses such as TcpPortPool. A stripped module PDB is therefore
+    # entirely usable, and rejecting one would refuse symbols that work.
+    symbol_count = len(isf.get("symbols", {}))
+
+    if is_kernel(kernel.pdb_name):
+        if not isf.get("user_types"):
+            raise FetchError(
+                f"{path.name} contains no type information "
+                f"({symbol_count} symbols, 0 user_types). Microsoft served a public "
+                "(stripped) PDB for this kernel, so Volatility cannot resolve kernel "
+                "structures from it. Use the Volatility community symbol pack instead: "
+                "https://downloads.volatilityfoundation.org/volatility3/symbols/windows.zip "
+                "— place it in the symbols folder, or build the bundle without --lean."
+            )
+    elif not symbol_count:
         raise FetchError(
-            f"{path.name} contains no type information "
-            f"({len(isf.get('symbols', {}))} symbols, 0 user_types). Microsoft served a "
-            "public (stripped) PDB for this kernel, so the ISF cannot be used. "
-            "Use the Volatility community symbol pack instead: "
-            "https://downloads.volatilityfoundation.org/volatility3/symbols/windows.zip "
-            "— place it in the symbols folder, or build the bundle without --lean."
+            f"{path.name} contains no symbols at all, so the plugins that need "
+            f"{kernel.pdb_name} cannot resolve their addresses."
         )
 
-    return len(isf.get("symbols", {}))
+    return symbol_count
 
 
 def fetch_one(kernel: KernelPdb, out_dir: Path, work_dir: Path, *, log=print) -> FetchResult:
