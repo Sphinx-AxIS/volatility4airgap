@@ -203,14 +203,29 @@ def write_deterministic_zip(folder: Path, archive: Path) -> None:
     trust.
     """
     archive.parent.mkdir(parents=True, exist_ok=True)
-    files = sorted(p for p in folder.rglob("*") if p.is_file())
+
+    def arcname(path: Path) -> str:
+        return str(Path(folder.name) / path.relative_to(folder)).replace("\\", "/")
+
+    # Directories are written explicitly. A zip stores none of its own accord, so
+    # empty ones — cache/ and output/ — simply vanish on extraction, and Volatility
+    # then fails with a bare FileNotFoundError on identifier.cache.
+    #
+    # One globally sorted pass keeps the archive deterministic, and because a
+    # directory entry's trailing "/" sorts before any name inside it, each
+    # directory still precedes its contents as extractors expect.
+    entries = sorted(
+        (arcname(p) + ("/" if p.is_dir() else ""), p) for p in folder.rglob("*")
+    )
 
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        for path in files:
-            info = zipfile.ZipInfo(
-                str(Path(folder.name) / path.relative_to(folder)).replace("\\", "/"),
-                date_time=(1980, 1, 1, 0, 0, 0),
-            )
+        for name, path in entries:
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            if path.is_dir():
+                info.external_attr = (0o755 << 16) | 0x10  # MS-DOS directory flag
+                zf.writestr(info, b"")
+                continue
+
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o644 << 16
             # Streamed, not read_bytes(): the symbol pack alone is 800 MB and

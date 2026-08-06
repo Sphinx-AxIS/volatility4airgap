@@ -295,3 +295,39 @@ class TestProbeDiagnosis:
     def test_a_genuine_isf_message_still_matches(self, tmp_path) -> None:
         result = self._result(tmp_path, "No ISF found for the required GUID")
         assert "could not load symbols" in triage.probe_diagnosis(result)
+
+
+class TestDirectoriesAreCreated:
+    """A zip stores no empty directories, so the bundle may arrive without them.
+
+    Volatility failed with a bare FileNotFoundError on identifier.cache when the
+    cache directory was absent — nothing an analyst could act on.
+    """
+
+    def test_creates_cache_and_output(self, tmp_path) -> None:
+        plan = make_plan(tmp_path, ["a.B"])
+        assert not plan.cache_dir.exists()
+        assert not plan.output_dir.exists()
+
+        plan.ensure_directories()
+
+        assert plan.cache_dir.is_dir()
+        assert plan.output_dir.is_dir()
+
+    def test_is_idempotent(self, tmp_path) -> None:
+        plan = make_plan(tmp_path, ["a.B"])
+        plan.ensure_directories()
+        plan.ensure_directories()  # must not raise
+        assert plan.cache_dir.is_dir()
+
+    def test_creates_nested_paths(self, tmp_path) -> None:
+        plan = triage.TriagePlan(
+            image=tmp_path / "i.raw",
+            output_dir=tmp_path / "deep" / "nested" / "out",
+            symbols_dir=tmp_path / "symbols",
+            cache_dir=tmp_path / "deep" / "nested" / "cache",
+            plugin_names=["a.B"],
+            formats=["csv"],
+        )
+        plan.ensure_directories()
+        assert plan.output_dir.is_dir() and plan.cache_dir.is_dir()

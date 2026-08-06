@@ -185,6 +185,10 @@ def cmd_triage(args: argparse.Namespace) -> int:
         timeout=args.timeout,
     )
 
+    # A zip stores no empty directories, so cache/ and output/ may not have
+    # survived extraction. Create them rather than trusting the bundle.
+    plan.ensure_directories()
+
     print(f"\nEngine {engine.name}, {len(plugin_names)} plugin(s), "
           f"formats {'+'.join(formats)}, jobs {jobs}")
     print(f"Output {output_dir}")

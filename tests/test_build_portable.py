@@ -339,3 +339,60 @@ class TestHowtoShips:
         text = (REPO_ROOT / "docs" / "HOWTO.md").read_text(encoding="utf-8")
         missing = [c for c in CATEGORIES if c not in text]
         assert not missing, f"HOWTO does not mention categories: {missing}"
+
+
+class TestEmptyDirectoriesSurvive:
+    """Regression: cache/ and output/ vanished on extraction.
+
+    A zip stores no directories unless they are written explicitly, so empty ones
+    disappeared and Volatility could not create its symbol cache on the target.
+    """
+
+    def test_empty_directories_are_archived(self, tmp_path) -> None:
+        root = make_tree(tmp_path / "Bundle", BASE)
+        (root / "cache").mkdir()
+        (root / "output").mkdir()
+
+        archive = tmp_path / "out.zip"
+        bp.write_deterministic_zip(root, archive)
+
+        with zipfile.ZipFile(archive) as zf:
+            names = zf.namelist()
+
+        assert "Bundle/cache/" in names
+        assert "Bundle/output/" in names
+
+    def test_they_survive_a_round_trip(self, tmp_path) -> None:
+        root = make_tree(tmp_path / "Bundle", BASE)
+        (root / "cache").mkdir()
+
+        archive = tmp_path / "out.zip"
+        bp.write_deterministic_zip(root, archive)
+
+        extracted = tmp_path / "extracted"
+        with zipfile.ZipFile(archive) as zf:
+            zf.extractall(extracted)
+
+        assert (extracted / "Bundle" / "cache").is_dir()
+
+    def test_archiving_stays_deterministic_with_directories(self, tmp_path) -> None:
+        root = make_tree(tmp_path / "Bundle", BASE)
+        (root / "cache").mkdir()
+        (root / "output").mkdir()
+
+        first, second = tmp_path / "a.zip", tmp_path / "b.zip"
+        bp.write_deterministic_zip(root, first)
+        bp.write_deterministic_zip(root, second)
+
+        assert first.read_bytes() == second.read_bytes()
+
+    def test_a_directory_precedes_its_contents(self, tmp_path) -> None:
+        """Extractors expect the parent entry first."""
+        root = make_tree(tmp_path / "Bundle", BASE)
+        archive = tmp_path / "out.zip"
+        bp.write_deterministic_zip(root, archive)
+
+        with zipfile.ZipFile(archive) as zf:
+            names = zf.namelist()
+
+        assert names.index("Bundle/app/") < names.index("Bundle/app/__main__.py")

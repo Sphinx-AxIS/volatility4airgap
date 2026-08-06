@@ -35,6 +35,18 @@ class TriagePlan:
     jobs: int = 1
     timeout: float = 3600.0
 
+    def ensure_directories(self) -> None:
+        """Create the directories a run writes into.
+
+        Never assume the bundle shipped them. A zip archive stores no entry for an
+        empty directory, so ``cache/`` and ``output/`` do not survive extraction —
+        and Volatility fails with a bare ``FileNotFoundError`` on
+        ``identifier.cache`` rather than anything an analyst could act on. Copying
+        a bundle with tools that skip empty directories has the same effect.
+        """
+        for directory in (self.output_dir, self.cache_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+
 
 @dataclass
 class PluginOutcome:
