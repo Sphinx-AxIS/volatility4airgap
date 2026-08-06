@@ -84,9 +84,11 @@ class FakeEngine(VolEngine):
 
     name = "fake"
 
-    def __init__(self, *, fail: set[str] | None = None, empty: set[str] | None = None):
+    def __init__(self, *, fail: set[str] | None = None, empty: set[str] | None = None,
+                 header_only: set[str] | None = None):
         self.fail = fail or set()
         self.empty = empty or set()
+        self.header_only = header_only or set()
 
     def available(self) -> bool:
         return True
@@ -97,6 +99,8 @@ class FakeEngine(VolEngine):
     def command(self, image, plugin, renderer, **kwargs) -> list[str]:
         if plugin in self.fail:
             code = "import sys; sys.stderr.write('plugin exploded'); raise SystemExit(1)"
+        elif plugin in self.header_only:
+            code = "print('PID,Name')"     # exits 0, emits only a header
         elif plugin in self.empty:
             code = "pass"
         elif renderer == "json":
@@ -363,3 +367,95 @@ class TestFirstRunNotice:
         assert "may take a few minutes" not in self._probe(
             tmp_path, with_pack=False, warmed=False
         )
+
+
+class TestNoDeprecatedPluginNames:
+    """Deprecated aliases still run, then stop working without warning.
+
+    windows.malfind.Malfind moved to windows.malware.malfind.Malfind and the old
+    name is due for removal in the first release after 2026-06-07. A curated set
+    that names aliases would break silently on a volatility upgrade.
+    """
+
+    def test_no_curated_plugin_is_a_deprecated_alias(self) -> None:
+        pytest.importorskip("volatility3")
+        import volatility3.framework
+        import volatility3.plugins
+
+        volatility3.framework.require_interface_version(2, 0, 0)
+        volatility3.framework.import_files(volatility3.plugins, True)
+        available = volatility3.framework.list_plugins()
+
+        aliases = []
+        for name in catalog.triage_names():
+            cls = available.get(name)
+            assert cls is not None, f"{name} does not exist in this volatility"
+            if getattr(getattr(cls, "run", None), "__wrapped__", None) is not None:
+                aliases.append(name)
+
+        assert not aliases, f"deprecated plugin aliases in the triage set: {aliases}"
+
+    def test_malware_plugins_use_the_malware_namespace(self) -> None:
+        for name in catalog.by_category("malware"):
+            assert name.startswith("windows.malware."), name
+
+    def test_malfind_uses_its_canonical_name(self) -> None:
+        names = catalog.triage_names()
+        assert "windows.malware.malfind.Malfind" in names
+        assert "windows.malfind.Malfind" not in names
+
+
+class TestRowCounting:
+    """Exit code 0 with a header-only file is not success worth reporting as such."""
+
+    def test_counts_data_rows_excluding_the_header(self, tmp_path) -> None:
+        path = tmp_path / "out.csv"
+        path.write_text("PID,Name\n4,System\n8,smss.exe\n", encoding="utf-8")
+        assert triage.count_rows(path) == 2
+
+    def test_a_header_only_file_is_zero_rows(self, tmp_path) -> None:
+        path = tmp_path / "out.csv"
+        path.write_text("PID,Name\n", encoding="utf-8")
+        assert triage.count_rows(path) == 0
+
+    def test_a_missing_file_is_zero(self, tmp_path) -> None:
+        assert triage.count_rows(tmp_path / "absent.csv") == 0
+
+    def test_outcomes_carry_row_counts(self, tmp_path) -> None:
+        plan = make_plan(tmp_path, ["windows.pslist.PsList"], formats=("csv",))
+        results = scheduler.run_tasks(triage.build_tasks(plan, FakeEngine()))
+        (outcome,) = triage.collect_outcomes(plan, results)
+        assert outcome.rows == 1  # FakeEngine emits one data row
+
+
+class TestEmptyResultDiagnosis:
+    """Every plugin succeeding with zero rows means the layer is not mapping."""
+
+    def _run(self, tmp_path, *, vmware_warning: bool):
+        plan = make_plan(tmp_path, ["windows.pslist.PsList"], formats=("csv",))
+        engine = FakeEngine(header_only={"windows.pslist.PsList"})
+        results = scheduler.run_tasks(triage.build_tasks(plan, engine))
+        outcomes = triage.collect_outcomes(plan, results)
+        if vmware_warning:
+            log = triage.log_path(plan.output_dir, "windows.pslist.PsList", "csv")
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text(
+                "WARNING volatility3.framework.layers.vmware: No metadata file found "
+                "alongside VMEM file.",
+                encoding="utf-8",
+            )
+        return triage.layer_warning(plan, outcomes)
+
+    def test_warns_when_everything_is_empty(self, tmp_path) -> None:
+        warning = self._run(tmp_path, vmware_warning=False)
+        assert warning is not None and "zero rows" in warning
+
+    def test_names_the_vmem_metadata_cause_when_present(self, tmp_path) -> None:
+        warning = self._run(tmp_path, vmware_warning=True)
+        assert ".raw" in warning and "VMSS" in warning
+
+    def test_silent_when_rows_were_produced(self, tmp_path) -> None:
+        plan = make_plan(tmp_path, ["windows.pslist.PsList"], formats=("csv",))
+        results = scheduler.run_tasks(triage.build_tasks(plan, FakeEngine()))
+        outcomes = triage.collect_outcomes(plan, results)
+        assert triage.layer_warning(plan, outcomes) is None

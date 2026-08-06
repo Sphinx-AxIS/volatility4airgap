@@ -208,7 +208,7 @@ extract.
 
 ## Choosing plugins
 
-The default is a curated 29-plugin Windows set. Everything in it is Windows-only, so no
+The default is a curated 39-plugin Windows set. Everything in it is Windows-only, so no
 time is wasted on Linux and macOS plugins that cannot apply.
 
 | Category | Count | Plugins |
@@ -221,6 +221,7 @@ time is wasted on Linux and macOS plugins that cannot apply.
 | `persistence` | 1 | `svcscan` |
 | `registry` | 3 | `hivelist`, `printkey`, `userassist` |
 | `kernel` | 4 | `driverscan`, `callbacks`, `ssdt`, `devicetree` |
+| `malware` | 10 | `psxview`, `hollowprocesses`, `ldrmodules`, `processghosting`, `pebmasquerade`, `suspicious_threads`, `unhooked_system_calls`, `drivermodule`, `svcdiff`, `skeleton_key_check` |
 | `objects` | 5 | `handles`, `filescan`, `mutantscan`, `symlinkscan`, `thrdscan` |
 
 Select by category, by name, or mix the two:
@@ -411,6 +412,14 @@ damaged capture format.
 **`Volatility could not load symbols`** (exit 4)
 Symbols are present but not the right ones. Run `symbols` to see exactly what is wanted,
 and `verify` to confirm what you have.
+
+**Plugins succeed but every output has only a header row**
+Volatility read the image but could not map its memory. The commonest cause is a
+`.vmem` opened without its `.vmss`/`.vmsn` companion: Volatility selects its VMware
+layer from the extension and cannot translate addresses without the metadata. Either put
+the companion file beside the image with the same basename, or copy the image to a `.raw`
+extension to force the raw physical layer. The tool reports this explicitly when every
+plugin returns zero rows.
 
 **Everything fails after copying symbols across**
 Check the folder landed in the right place. The tool expects

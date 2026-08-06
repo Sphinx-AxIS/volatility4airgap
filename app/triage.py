@@ -48,10 +48,26 @@ class TriagePlan:
             directory.mkdir(parents=True, exist_ok=True)
 
 
+def count_rows(path: Path) -> int:
+    """Data rows in a CSV output, excluding the header.
+
+    A plugin can exit 0 having produced only a header. For pslist on a Windows
+    image that means the layer is not mapping memory — commonly a .vmem opened
+    without its .vmss/.vmsn companion — and reporting it as success hides the one
+    fact the analyst needs.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return max(0, sum(1 for _ in handle) - 1)
+    except OSError:
+        return 0
+
+
 @dataclass
 class PluginOutcome:
     plugin: str
     results: dict = field(default_factory=dict)  # format -> TaskResult
+    rows: int | None = None
 
     @property
     def ok(self) -> bool:
@@ -172,7 +188,49 @@ def collect_outcomes(
         plugin, _, fmt = result.task.key.rpartition(":")
         outcome = by_plugin.setdefault(plugin, PluginOutcome(plugin))
         outcome.results[fmt] = result
-    return [by_plugin[name] for name in plan.plugin_names if name in by_plugin]
+
+    ordered = [by_plugin[name] for name in plan.plugin_names if name in by_plugin]
+    for outcome in ordered:
+        if "csv" in outcome.results and outcome.results["csv"].ok:
+            outcome.rows = count_rows(output_path(plan.output_dir, outcome.plugin, "csv"))
+    return ordered
+
+
+def layer_warning(plan: TriagePlan, outcomes: list[PluginOutcome]) -> str | None:
+    """Explain a run where every plugin succeeded but produced no rows.
+
+    That pattern means Volatility read the file but could not map memory, so the
+    plugins walk empty structures and exit cleanly. Without an explanation it
+    looks like a clean image with nothing on it.
+    """
+    counted = [o for o in outcomes if o.rows is not None]
+    if not counted or any(o.rows for o in counted):
+        return None
+
+    hint = ""
+    for outcome in outcomes:
+        for fmt in outcome.results:
+            try:
+                text = log_path(plan.output_dir, outcome.plugin, fmt).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                continue
+            if "vmware" in text.lower() and "metadata" in text.lower():
+                hint = (
+                    "\n  Volatility warned that this VMEM has no VMSS/VMSN metadata "
+                    "beside it.\n  Either place the companion file next to the image "
+                    "(same basename), or\n  copy the image to a .raw extension to force "
+                    "the raw physical layer."
+                )
+                break
+        if hint:
+            break
+
+    return (
+        "Every plugin succeeded but returned zero rows. Volatility read the image "
+        "yet could not map its memory, so nothing was found to report." + hint
+    )
 
 
 def prune_empty_outputs(plan: TriagePlan, outcomes: list[PluginOutcome]) -> int:
@@ -205,6 +263,7 @@ def plugin_records(outcomes: list[PluginOutcome]) -> list[dict]:
                 "plugin": outcome.plugin,
                 "status": "ok" if outcome.ok else "failed",
                 "detail": None if outcome.ok else outcome.status(),
+                "rows": outcome.rows,
                 "seconds": round(outcome.duration, 2),
                 "formats": {
                     fmt: {

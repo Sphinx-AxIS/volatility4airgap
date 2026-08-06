@@ -44,7 +44,9 @@ TRIAGE: tuple[Plugin, ...] = (
     Plugin("windows.netscan.NetScan", "network", cost="slow"),
     Plugin("windows.netstat.NetStat", "network", cost="slow"),
     # Injection and unbacked code.
-    Plugin("windows.malfind.Malfind", "injection", cost="slow"),
+    # Canonical name: windows.malfind.Malfind still resolves but is a deprecated
+    # alias, due for removal in the first release after 2026-06-07.
+    Plugin("windows.malware.malfind.Malfind", "injection", cost="slow"),
     Plugin("windows.vadinfo.VadInfo", "injection", cost="slow"),
     Plugin("windows.dlllist.DllList", "modules"),
     Plugin("windows.modules.Modules", "modules"),
@@ -59,6 +61,19 @@ TRIAGE: tuple[Plugin, ...] = (
     Plugin("windows.callbacks.Callbacks", "kernel"),
     Plugin("windows.ssdt.SSDT", "kernel"),
     Plugin("windows.devicetree.DeviceTree", "kernel"),
+    # Dedicated malware hunting. These are the highest-yield plugins in an
+    # intrusion investigation and are cheap to include: a plugin that cannot apply
+    # to this image fails, is logged, and does not affect the rest of the run.
+    Plugin("windows.malware.psxview.PsXView", "malware", cost="slow"),
+    Plugin("windows.malware.hollowprocesses.HollowProcesses", "malware", cost="slow"),
+    Plugin("windows.malware.ldrmodules.LdrModules", "malware", cost="slow"),
+    Plugin("windows.malware.processghosting.ProcessGhosting", "malware", cost="slow"),
+    Plugin("windows.malware.pebmasquerade.PebMasquerade", "malware", cost="slow"),
+    Plugin("windows.malware.suspicious_threads.SuspiciousThreads", "malware", cost="slow"),
+    Plugin("windows.malware.unhooked_system_calls.UnhookedSystemCalls", "malware"),
+    Plugin("windows.malware.drivermodule.DriverModule", "malware", cost="slow"),
+    Plugin("windows.malware.svcdiff.SvcDiff", "malware", cost="slow"),
+    Plugin("windows.malware.skeleton_key_check.Skeleton_Key_Check", "malware"),
     # Objects and handles. Handles is among the slowest here.
     Plugin("windows.handles.Handles", "objects", cost="slow"),
     Plugin("windows.filescan.FileScan", "objects", cost="slow"),

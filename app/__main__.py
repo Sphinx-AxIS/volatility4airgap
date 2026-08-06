@@ -261,6 +261,13 @@ def cmd_triage(args: argparse.Namespace) -> int:
     failed = [o for o in outcomes if not o.ok]
 
     print(f"\n{len(succeeded)}/{len(outcomes)} plugin(s) succeeded.")
+    for outcome in succeeded:
+        if outcome.rows is not None:
+            print(f"  {outcome.rows:>7,} rows  {outcome.plugin}")
+
+    warning = triage.layer_warning(plan, outcomes)
+    if warning:
+        print(f"\nWARNING: {warning}")
     if pruned:
         print(f"Removed {pruned} empty output file(s); logs kept.")
     if failed:
