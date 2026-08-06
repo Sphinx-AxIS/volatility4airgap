@@ -331,3 +331,35 @@ class TestDirectoriesAreCreated:
         )
         plan.ensure_directories()
         assert plan.output_dir.is_dir() and plan.cache_dir.is_dir()
+
+
+class TestFirstRunNotice:
+    """An unannounced multi-minute pause reads as a hang."""
+
+    def _probe(self, tmp_path, *, with_pack: bool, warmed: bool):
+        plan = make_plan(tmp_path, ["a.B"])
+        plan.symbols_dir.mkdir(parents=True, exist_ok=True)
+        plan.cache_dir.mkdir(parents=True, exist_ok=True)
+        if with_pack:
+            (plan.symbols_dir / "windows.zip").write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+        if warmed:
+            (plan.cache_dir / "identifier.cache").write_bytes(b"cached")
+
+        lines = []
+        triage.run_probe(plan, FakeEngine(), log=lines.append)
+        return "\n".join(lines)
+
+    def test_warns_on_a_cold_cache_with_a_pack(self, tmp_path) -> None:
+        assert "may take a few minutes" in self._probe(
+            tmp_path, with_pack=True, warmed=False
+        )
+
+    def test_silent_once_the_cache_is_warm(self, tmp_path) -> None:
+        assert "may take a few minutes" not in self._probe(
+            tmp_path, with_pack=True, warmed=True
+        )
+
+    def test_silent_without_a_pack(self, tmp_path) -> None:
+        assert "may take a few minutes" not in self._probe(
+            tmp_path, with_pack=False, warmed=False
+        )

@@ -120,6 +120,14 @@ def run_probe(plan: TriagePlan, engine: VolEngine, *, log=print) -> scheduler.Ta
     )
 
     log(f"Probing with {plugin_catalog.PROBE} (validates symbols, warms the cache)...")
+
+    # Indexing the 800 MB symbol pack takes minutes and prints nothing while it
+    # happens. Unannounced, that reads as a hang and invites a Ctrl-C at exactly
+    # the wrong moment. It is paid once per bundle location.
+    cache_db = plan.cache_dir / "identifier.cache"
+    if not cache_db.exists() and any(plan.symbols_dir.rglob("*.zip")):
+        log("  First run with a symbol pack: indexing it may take a few minutes.")
+        log("  This happens once. Subsequent runs start immediately.")
     (result,) = scheduler.run_tasks([task], jobs=1, timeout=plan.timeout)
     return result
 
