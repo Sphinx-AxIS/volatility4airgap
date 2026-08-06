@@ -21,6 +21,7 @@ Mirrors volatility3's own construction:
 
 from __future__ import annotations
 
+import hashlib
 import re
 import struct
 from collections.abc import Iterable, Iterator
@@ -206,12 +207,20 @@ def iter_rsds(
     *,
     pdb_names: Iterable[bytes] | None = KERNEL_PDB_NAMES,
     chunk_size: int = 8 << 20,
+    digest: "hashlib._Hash | None" = None,
 ) -> Iterator[KernelPdb]:
     """Scan a stream for RSDS records, yielding each distinct match once.
 
     Reads in overlapping windows so a record straddling a chunk boundary is still
     found. ``pdb_names`` filters to the kernel by default; pass ``None`` to accept
     every PDB in the image.
+
+    ``digest`` is updated with each byte read, so a chain-of-custody hash costs no
+    extra I/O over an image that may be tens of gigabytes. Only freshly read bytes
+    are fed to it — never the carried overlap, which would be counted twice.
+
+    Because this is a generator, ``digest`` is complete only once the caller has
+    exhausted it. Prefer :func:`scan_image`, which cannot be left half-consumed.
     """
     wanted = None if pdb_names is None else {n.lower() for n in pdb_names}
     overlap = 0x4000  # comfortably larger than _MAX_RECORD
@@ -227,6 +236,9 @@ def iter_rsds(
     while True:
         chunk = stream.read(chunk_size)
         at_eof = not chunk
+        # Hash the fresh bytes only. `buf` below repeats the carried overlap.
+        if digest is not None and chunk:
+            digest.update(chunk)
         buf = carry + chunk
         base = carry_base
         search = 0
@@ -267,17 +279,48 @@ def iter_rsds(
         carry_base = consumed - keep
 
 
+@dataclass(frozen=True)
+class ScanResult:
+    """What one pass over a memory image produced."""
+
+    kernels: list[KernelPdb]
+    bytes_read: int
+    sha256: str | None = None
+
+    @property
+    def is_ambiguous(self) -> bool:
+        """True when the image holds more than one kernel build."""
+        return len(self.kernels) > 1
+
+
 def scan_image(
     path: Path | str,
     *,
     pdb_names: Iterable[bytes] | None = KERNEL_PDB_NAMES,
     chunk_size: int = 8 << 20,
-) -> list[KernelPdb]:
-    """Scan a memory image file and return every distinct kernel PDB found.
+    hash_image: bool = True,
+) -> ScanResult:
+    """Scan a memory image once, returning every kernel found and its digest.
 
-    Ordinarily returns exactly one entry. More than one usually means the image
-    holds several kernel builds — for instance a hibernation remnant — and the
-    caller should surface the ambiguity rather than guessing.
+    Ordinarily finds exactly one kernel. More than one usually means the image
+    holds several builds — a hibernation remnant, or a capture spanning a reboot.
+    The caller should surface that rather than guessing; symbols are small enough
+    that fetching all of them beats a second trip to the networked machine.
+
+    The scan already reads every byte, so ``hash_image`` computes the
+    chain-of-custody SHA-256 in the same pass. Hashing separately would mean a
+    second full read of an image that may be tens of gigabytes.
     """
+    digest = hashlib.sha256() if hash_image else None
+
     with open(path, "rb") as handle:
-        return list(iter_rsds(handle, pdb_names=pdb_names, chunk_size=chunk_size))
+        kernels = list(
+            iter_rsds(handle, pdb_names=pdb_names, chunk_size=chunk_size, digest=digest)
+        )
+        bytes_read = handle.tell()
+
+    return ScanResult(
+        kernels=kernels,
+        bytes_read=bytes_read,
+        sha256=digest.hexdigest() if digest is not None else None,
+    )

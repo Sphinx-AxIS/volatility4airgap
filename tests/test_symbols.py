@@ -7,6 +7,7 @@ reappear.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import struct
 
@@ -258,9 +259,84 @@ class TestScanImage:
         image = tmp_path / "image.raw"
         image.write_bytes(image_with(record, offset=8192, total=1 << 20))
 
-        found = scan_image(image)
-        assert len(found) == 1
-        assert found[0].download_url == GOLDEN_URL
-        assert found[0].isf_path(tmp_path / "symbols").name == (
+        result = scan_image(image)
+        assert len(result.kernels) == 1
+        assert result.kernels[0].download_url == GOLDEN_URL
+        assert result.kernels[0].isf_path(tmp_path / "symbols").name == (
             f"{GOLDEN_GUID}-{GOLDEN_AGE}.json.xz"
         )
+
+    def test_reports_ambiguity_when_several_kernels_present(self, tmp_path) -> None:
+        first = rsds_record(GOLDEN_GUID, 1, GOLDEN_NAME)
+        second = rsds_record("0" * 31 + "1", 2, "ntoskrnl.pdb")
+        data = bytearray(image_with(first, offset=1000, total=1 << 20))
+        data[60000 : 60000 + len(second)] = second
+
+        image = tmp_path / "image.raw"
+        image.write_bytes(bytes(data))
+
+        result = scan_image(image)
+        assert len(result.kernels) == 2
+        assert result.is_ambiguous is True
+
+    def test_single_kernel_is_not_ambiguous(self, tmp_path) -> None:
+        image = tmp_path / "image.raw"
+        image.write_bytes(
+            image_with(rsds_record(GOLDEN_GUID, 1, GOLDEN_NAME), offset=512, total=1 << 19)
+        )
+        assert scan_image(image).is_ambiguous is False
+
+
+class TestHashDuringScan:
+    """The scan reads every byte, so the custody hash must come free with it."""
+
+    def test_digest_matches_the_file(self, tmp_path) -> None:
+        record = rsds_record(GOLDEN_GUID, GOLDEN_AGE, GOLDEN_NAME)
+        image = tmp_path / "image.raw"
+        image.write_bytes(image_with(record, offset=8192, total=1 << 20))
+
+        result = scan_image(image)
+        assert result.sha256 == hashlib.sha256(image.read_bytes()).hexdigest()
+
+    def test_overlap_is_not_hashed_twice(self, tmp_path) -> None:
+        """The window carries an overlap forward; hashing it again corrupts the digest.
+
+        Uses a chunk size far below the file size so many overlaps occur, and plants
+        a record across a boundary so the carry is genuinely exercised.
+        """
+        chunk = 0x8000
+        record = rsds_record(GOLDEN_GUID, GOLDEN_AGE, GOLDEN_NAME)
+        image = tmp_path / "image.raw"
+        image.write_bytes(image_with(record, offset=chunk - 10, total=chunk * 7))
+
+        result = scan_image(image, chunk_size=chunk)
+
+        assert result.sha256 == hashlib.sha256(image.read_bytes()).hexdigest()
+        assert result.bytes_read == chunk * 7
+        assert len(result.kernels) == 1
+
+    @pytest.mark.parametrize("size", [0, 1, 0x4001, 0x8000, (1 << 20) + 7])
+    def test_digest_correct_across_sizes(self, tmp_path, size: int) -> None:
+        image = tmp_path / "image.raw"
+        image.write_bytes(b"\xcc" * size)
+
+        result = scan_image(image, chunk_size=0x8000)
+        assert result.sha256 == hashlib.sha256(b"\xcc" * size).hexdigest()
+        assert result.bytes_read == size
+
+    def test_hashing_can_be_disabled(self, tmp_path) -> None:
+        image = tmp_path / "image.raw"
+        image.write_bytes(b"\xcc" * 4096)
+
+        result = scan_image(image, hash_image=False)
+        assert result.sha256 is None
+        assert result.bytes_read == 4096
+
+    def test_digest_is_optional_on_the_low_level_scan(self) -> None:
+        data = image_with(rsds_record(GOLDEN_GUID, 1, GOLDEN_NAME), offset=100, total=1 << 19)
+        digest = hashlib.sha256()
+
+        found = list(iter_rsds(io.BytesIO(data), digest=digest))
+
+        assert len(found) == 1
+        assert digest.hexdigest() == hashlib.sha256(data).hexdigest()

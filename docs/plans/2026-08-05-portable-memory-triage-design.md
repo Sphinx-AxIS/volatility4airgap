@@ -222,12 +222,37 @@ produces an output set that looks complete but is not.
 }
 ```
 
-`image.sha256` is null here because hashing a multi-gigabyte image is expensive; the run
-manifest records it instead. Since the RSDS scan already reads every byte, Stage 3 should
-compute the digest in that same pass rather than making a second one.
+`image.sha256` is null only when the caller did not supply one. Normally it is present,
+because the digest is computed during the scan — see below.
 
 On load, URLs are re-derived from the stored identity rather than trusted, so a
 hand-edited or corrupted request cannot silently redirect a download.
+
+### Hashing in the scan pass
+
+The chain-of-custody SHA-256 is computed *during* the RSDS scan rather than by a separate
+read. The scan already touches every byte, so the digest costs no additional I/O. Hashing
+separately would mean a second full pass over an image that may be tens of gigabytes —
+minutes of avoidable wall-clock on every run, and twice the read wear on the evidence
+drive.
+
+`scan_image()` therefore returns a `ScanResult` carrying `kernels`, `bytes_read` and
+`sha256`, rather than a bare list. One pass, both answers.
+
+Two hazards this introduces, both guarded by tests:
+
+1. **Double-counting the overlap.** The scanner carries a 16 KB window forward so records
+   straddling a chunk boundary are still found. Only freshly read bytes are fed to the
+   digest; hashing the reconstructed buffer would count the carried bytes twice and
+   produce a wrong hash that still looks plausible. A test scans a file spanning seven
+   chunks, with a record planted across a boundary, and compares against the digest of the
+   whole file.
+2. **A half-consumed generator.** `iter_rsds()` is lazy, so its `digest` is complete only
+   once the caller exhausts it. `scan_image()` is the supported entry point precisely
+   because it cannot be left partly consumed; the low-level `digest` parameter is
+   documented as advanced use.
+
+Hashing can be disabled with `hash_image=False` for a fast symbol-only probe.
 
 **Closing the loop.** On the internet-connected machine, `fetch-symbols
 symbol_request.json` downloads the PDB, converts it with `PdbReader`, writes it under the
