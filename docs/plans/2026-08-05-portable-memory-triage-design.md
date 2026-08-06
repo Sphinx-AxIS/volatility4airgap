@@ -175,28 +175,59 @@ mixed-endian 16-byte GUID, a 4-byte age and a NUL-terminated name — covers raw
 and `.dmp`, cross-checked against `-vvv` output. Neither path treats scraped text as its
 primary source.
 
-**On a miss** the tool prints the URL, writes `symbol_request.json`, and stops without
+**Every match is fetched, not just one.** A scan can legitimately find more than one
+kernel build — a hibernation remnant, or a capture spanning a reboot. ISF files are small,
+so the request carries a *list* and `fetch-symbols` downloads all of them. Guessing which
+build Volatility will select would risk a second round trip to save a few megabytes.
+
+**Presence means available, not merely on disk.** Volatility reads ISF files both as loose
+files and as members of zip archives, which is how the bundled 800 MB `windows.zip` is
+consumed. Checking only for loose files would send the analyst to fetch symbols the bundle
+already contains. `SymbolStore` therefore indexes archive central directories as well,
+matching on the `{GUID}-{age}.json.xz` filename because the pack's internal layout is not
+contractual.
+
+**On a miss** the tool prints the URLs, writes `symbol_request.json`, and stops without
 running plugins. Stopping is deliberate: a partial run of symbol-independent plugins
 produces an output set that looks complete but is not.
 
 ```json
 {
-  "image": "C:\\evidence\\image.raw",
-  "image_sha256": "...",
+  "schema_version": 1,
+  "tool_version": "0.1.0",
   "generated_utc": "2026-08-05T21:14:00Z",
-  "kernel": {
-    "pdb_name": "ntkrnlmp.pdb",
-    "guid": "AF550CAA73AFB287705CC40079D786B4",
-    "age": 1,
-    "guid_age": "AF550CAA73AFB287705CC40079D786B41"
+  "image": {
+    "path": "C:\\evidence\\image.raw",
+    "name": "image.raw",
+    "size_bytes": 8589934592,
+    "sha256": null
   },
-  "download": {
-    "primary_url": "http://msdl.microsoft.com/download/symbols/ntkrnlmp.pdb/AF550CAA73AFB287705CC40079D786B41/ntkrnlmp.pdb",
-    "compressed_fallback_url": "http://msdl.microsoft.com/download/symbols/ntkrnlmp.pdb/AF550CAA73AFB287705CC40079D786B41/ntkrnlmp.pd_"
-  },
-  "required_isf": "symbols/windows/ntkrnlmp.pdb/AF550CAA73AFB287705CC40079D786B4-1.json.xz"
+  "kernels": [
+    {
+      "pdb_name": "ntkrnlmp.pdb",
+      "guid": "AF550CAA73AFB287705CC40079D786B4",
+      "age": 1,
+      "guid_age": "AF550CAA73AFB287705CC40079D786B41",
+      "offset": 4096,
+      "download": {
+        "primary_url": "http://msdl.microsoft.com/download/symbols/ntkrnlmp.pdb/AF550CAA73AFB287705CC40079D786B41/ntkrnlmp.pdb",
+        "compressed_fallback_url": "http://msdl.microsoft.com/download/symbols/ntkrnlmp.pdb/AF550CAA73AFB287705CC40079D786B41/ntkrnlmp.pd_"
+      },
+      "required_isf": "windows/ntkrnlmp.pdb/AF550CAA73AFB287705CC40079D786B4-1.json.xz",
+      "present": false,
+      "found_at": null
+    }
+  ],
+  "missing_count": 1
 }
 ```
+
+`image.sha256` is null here because hashing a multi-gigabyte image is expensive; the run
+manifest records it instead. Since the RSDS scan already reads every byte, Stage 3 should
+compute the digest in that same pass rather than making a second one.
+
+On load, URLs are re-derived from the stored identity rather than trusted, so a
+hand-edited or corrupted request cannot silently redirect a download.
 
 **Closing the loop.** On the internet-connected machine, `fetch-symbols
 symbol_request.json` downloads the PDB, converts it with `PdbReader`, writes it under the
