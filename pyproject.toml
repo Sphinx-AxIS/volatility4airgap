@@ -1,0 +1,23 @@
+[project]
+name = "volatility4airgap"
+version = "0.1.0"
+description = "Portable Volatility3 triage for air-gapped Windows workstations"
+requires-python = ">=3.9"
+# The tool itself uses only the standard library. volatility3 is supplied by the
+# bundle's lib/ directory, not installed here.
+dependencies = []
+
+[project.optional-dependencies]
+# volatility3 is a *test* dependency only, for tests/test_differential_volatility.py,
+# which checks our symbol-server derivations still agree with upstream. The shipped
+# tool gets volatility3 from the bundle's lib/ directory instead.
+dev = ["pytest>=8.0", "volatility3>=2.28"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
