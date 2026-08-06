@@ -287,3 +287,55 @@ class TestDashMSemantics:
 
         assert result.returncode != 0
         assert "No module named app" in result.stderr
+
+
+class TestHowtoShips:
+    """The reference must travel with the bundle.
+
+    An analyst on an air-gapped workstation cannot open the repository to read it,
+    so a HOWTO that only exists in docs/ is a HOWTO they do not have.
+    """
+
+    def test_the_howto_exists_in_the_repo(self) -> None:
+        assert (REPO_ROOT / "docs" / "HOWTO.md").is_file()
+
+    def test_it_documents_every_command(self) -> None:
+        import sys
+
+        sys.path.insert(0, str(REPO_ROOT))
+        from app.__main__ import _COMMANDS
+
+        text = (REPO_ROOT / "docs" / "HOWTO.md").read_text(encoding="utf-8")
+        missing = [c for c in _COMMANDS if c not in text]
+        assert not missing, f"HOWTO does not mention: {missing}"
+
+    def test_it_documents_every_triage_option(self) -> None:
+        import sys
+
+        sys.path.insert(0, str(REPO_ROOT))
+        from app.__main__ import build_parser
+
+        parser = build_parser()
+        triage = [
+            a for a in parser._actions if getattr(a, "dest", None) == "command"
+        ][0].choices["triage"]
+
+        flags = {
+            option
+            for action in triage._actions
+            for option in action.option_strings
+            if option.startswith("--") and option != "--help"
+        }
+        text = (REPO_ROOT / "docs" / "HOWTO.md").read_text(encoding="utf-8")
+        missing = sorted(f for f in flags if f not in text)
+        assert not missing, f"HOWTO does not document triage options: {missing}"
+
+    def test_it_documents_every_plugin_category(self) -> None:
+        import sys
+
+        sys.path.insert(0, str(REPO_ROOT))
+        from app.plugins import CATEGORIES
+
+        text = (REPO_ROOT / "docs" / "HOWTO.md").read_text(encoding="utf-8")
+        missing = [c for c in CATEGORIES if c not in text]
+        assert not missing, f"HOWTO does not mention categories: {missing}"

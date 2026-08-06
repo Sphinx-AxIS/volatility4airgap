@@ -304,6 +304,15 @@ def build(args: argparse.Namespace) -> Path:
     (bundle / "v4ag.bat").write_text(LAUNCHER_BAT, encoding="utf-8")
     log("copied app/ and wrote v4ag.bat")
 
+    # The reference has to travel with the bundle. An analyst on an air-gapped
+    # workstation cannot open the repository to read it.
+    howto = REPO_ROOT / "docs" / "HOWTO.md"
+    if howto.is_file():
+        shutil.copy2(howto, bundle / "HOWTO.md")
+        log("included HOWTO.md")
+    else:
+        log("WARNING: docs/HOWTO.md not found; bundle will ship without a reference")
+
     # 4. Optional official binary, for --engine exe
     vol_exe_sha = None
     if args.vol_exe:
