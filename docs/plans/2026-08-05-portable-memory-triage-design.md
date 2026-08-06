@@ -140,13 +140,16 @@ polling `proc.poll()` against a deadline enforces the timeout reliably.
 
 ### Contention at `--jobs > 1`
 
-1. **Symbol cache locking.** Volatility caches symbol identifiers in a SQLite database at
-   `%APPDATA%\volatility3\identifier.cache`. Concurrent workers populating it produce
-   intermittent `database is locked` failures. The scheduler pre-warms the cache once,
-   serially, during symbol resolution and before any worker starts. `APPDATA` is pinned
-   per child to `<bundle>/cache`, which both shares one warm cache and keeps the
-   analyst's roaming profile clean. Volatility exposes no dedicated cache variable;
-   `APPDATA` is the documented mechanism on Windows.
+1. **Symbol cache locking.** Volatility caches symbol identifiers in a SQLite database.
+   Concurrent workers populating it produce intermittent `database is locked` failures.
+   The run therefore executes one cheap plugin serially — the probe — before any worker
+   starts. The cache location is set with the CLI's `--cache-path` flag, pointed at
+   `<bundle>/cache`, so every worker shares one warm cache and the analyst's roaming
+   profile is left untouched.
+
+   *(An earlier draft of this design claimed Volatility exposes no cache-location option
+   and proposed overriding `APPDATA` per child. That was wrong — it was based on reading
+   `constants.py` rather than the CLI. `--cache-path` is the supported mechanism.)*
 2. **Disk I/O.** Every plugin streams the same multi-GB image. On NVMe with sufficient
    RAM the page cache absorbs this and `N=4` is a substantial win. On a USB-attached or
    spinning evidence drive, `N>2` can be slower than `N=1`. The tool warns when the image
@@ -154,6 +157,39 @@ polling `proc.poll()` against a deadline enforces the timeout reliably.
 
 Per-plugin logs are written to separate files so parallel output never interleaves. The
 console shows a single aggregated progress line.
+
+### The probe
+
+Before committing to a full run, one cheap plugin (`windows.info.Info`) runs on its own.
+It earns its place three times over:
+
+- It proves symbols resolve. If they do not, the analyst gets one clear diagnosis instead
+  of twenty-nine confusing failures.
+- It warms the SQLite cache serially, which is both what prevents `database is locked`
+  under `--jobs > 1` and what makes the bundled symbol pack reachable at all.
+- It confirms the image is a supported Windows capture before minutes are spent on it.
+
+A failed probe aborts with a diagnosis and exit code 4, overridable with `--force`.
+
+Reading that diagnosis has one trap worth recording: Volatility's commonest failure is
+`unsatisfied requirement …`, and the string *unsat**isf**ied* contains `isf`. A naive
+substring test for symbol-related errors matches it and tells the analyst to go fetch
+symbols they already have — a wasted trip across the air gap. The check tests for
+`unsatisfied`/`requirement` first, and uses a word boundary for `isf`.
+
+### Two further flags that matter on an air-gapped host
+
+- **`--offline`** stops Volatility searching online for symbols. Without it, a symbol miss
+  sends it to `msdl.microsoft.com` and the host waits out the timeout on *every plugin*.
+- **`--parallelism off`** disables Volatility's own internal fan-out. Combined with
+  `--jobs`, leaving it enabled would oversubscribe the machine by roughly the core count.
+
+### Empty outputs are removed
+
+A plugin that fails can still leave a zero-byte `windows.netscan.NetScan.csv`. In a results
+folder that reads as "no network artefacts found" rather than "this plugin did not run",
+which is a materially misleading thing to hand an analyst. Empty outputs are deleted; the
+per-plugin log is always kept, so nothing diagnostic is lost.
 
 ## Symbol resolution
 

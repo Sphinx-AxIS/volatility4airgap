@@ -11,21 +11,32 @@ Installs nothing. Needs no Python on the target and no administrator rights.
 
 ## Status
 
-Symbol identification and the portable bundle build are done. Plugin execution
-(`triage`, `--jobs`) is next.
+Feature complete.
 
 | | |
 | --- | --- |
-| `symbols` | working — identifies the kernel, reports URLs, writes `symbol_request.json` |
-| `verify` | working — checks a request is satisfied before you walk back |
-| `fetch-symbols` | not yet built |
-| `triage` | not yet built |
+| `triage` | runs plugins, one CSV and one JSON each, with `--jobs` |
+| `symbols` | identifies the kernel, reports URLs, writes `symbol_request.json` |
+| `fetch-symbols` | downloads and converts symbols on the connected side |
+| `verify` | checks a request is satisfied before you walk back |
+| `doctor` | reports build identity, architecture and import health |
 
 Design: [docs/plans/2026-08-05-portable-memory-triage-design.md](docs/plans/2026-08-05-portable-memory-triage-design.md)
 
 ## The workflow
 
 On the air-gapped workstation:
+
+```
+v4ag.bat triage --image E:\evidence\image.raw --jobs 4
+```
+
+Results land in `output\<image>\` as `windows.pslist.PsList.csv` and `.json`, one pair
+per plugin, alongside `run-manifest.json` recording the image digest, every plugin's
+outcome and a SHA-256 for each output. Per-plugin logs go to `output\<image>\logs\`.
+
+If symbols are missing, `triage` stops before running anything and writes the request. To
+see what is needed without starting a run:
 
 ```
 v4ag.bat symbols --image E:\evidence\image.raw
@@ -43,8 +54,26 @@ Note that the URL segment and the ISF filename are *not* the same string. The UR
 concatenates the GUID and age; the filename joins them with a hyphen. Getting this wrong
 produces a symbol file Volatility silently ignores.
 
-Copy the resulting `symbols/` folder back and re-run. Exit codes: `0` ready, `1` no kernel
-found, `2` bad input, `3` symbols missing.
+Copy the resulting `symbols/` folder back and re-run.
+
+Exit codes: `0` success, `1` plugin failures or no kernel found, `2` bad input,
+`3` symbols missing, `4` probe failed.
+
+### Choosing plugins
+
+```
+v4ag.bat triage --image ... --plugins network,registry     # by category
+v4ag.bat triage --image ... --plugins windows.pslist.PsList
+v4ag.bat triage --image ... --all                          # every Windows plugin
+v4ag.bat triage --image ... --format csv                   # skip JSON, halves the work
+```
+
+The default is a curated 29-plugin Windows triage set. Each requested format is rendered
+by its own Volatility run, so `--format csv,json` runs each plugin twice; narrow it if
+wall-clock matters more than having both.
+
+`--jobs` defaults to 1. Parallelism helps on NVMe with enough RAM to cache the image, and
+can *hurt* on a USB-attached evidence drive where workers contend for the same reads.
 
 ## Building
 

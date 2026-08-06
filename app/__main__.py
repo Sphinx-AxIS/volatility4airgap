@@ -108,6 +108,137 @@ def cmd_symbols(args: argparse.Namespace) -> int:
     return 3
 
 
+def cmd_triage(args: argparse.Namespace) -> int:
+    """Run plugins against an image. The main event."""
+    from . import engine as engine_mod, manifest, plugins as catalog, scheduler, triage
+
+    image = Path(args.image).expanduser()
+    if not image.is_file():
+        print(f"error: image not found: {image}", file=sys.stderr)
+        return 2
+
+    symbols_dir = Path(args.symbols).expanduser() if args.symbols else default_symbols_dir()
+
+    try:
+        jobs = scheduler.resolve_jobs(args.jobs)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    formats = [f.strip() for f in args.format.split(",") if f.strip()]
+    unknown = [f for f in formats if f not in engine_mod.RENDERERS]
+    if unknown:
+        print(f"error: unknown format(s): {', '.join(unknown)}", file=sys.stderr)
+        return 2
+
+    try:
+        engine = engine_mod.select(args.engine, BUNDLE_ROOT)
+    except (engine_mod.EngineUnavailable, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    # Identify the kernel and hash the image in one pass.
+    print(f"Scanning {image.name} ({image.stat().st_size / 1e9:.2f} GB)...")
+    scan = scan_image(image, hash_image=not args.no_hash)
+    if not scan.kernels:
+        print("\nNo Windows kernel PDB record found.")
+        return 1
+    if scan.sha256:
+        print(f"SHA-256  {scan.sha256}")
+
+    store = SymbolStore(symbols_dir)
+    missing = store.missing(scan.kernels)
+    if missing and not args.force:
+        document = symbol_request.build(
+            image, scan.kernels, store=store, image_sha256=scan.sha256
+        )
+        destination = Path(args.output or Path.cwd()) / symbol_request.FILENAME
+        symbol_request.write(destination, document)
+        print(f"\n{len(missing)} symbol file(s) missing; not running plugins.")
+        for kernel in missing:
+            print(f"  {kernel.pdb_name}  {kernel.download_url}")
+        print(f"\nWrote {destination}. Run 'fetch-symbols' on a connected machine.")
+        return 3
+
+    try:
+        plugin_names = catalog.resolve(args.plugins, all_plugins=args.all)
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: could not resolve plugins: {exc}", file=sys.stderr)
+        return 2
+    if not plugin_names:
+        print("error: no plugins selected", file=sys.stderr)
+        return 2
+
+    output_dir = Path(args.out).expanduser() if args.out else (
+        BUNDLE_ROOT / "output" / f"{image.stem}"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    plan = triage.TriagePlan(
+        image=image,
+        output_dir=output_dir,
+        symbols_dir=symbols_dir,
+        cache_dir=BUNDLE_ROOT / "cache",
+        plugin_names=plugin_names,
+        formats=formats,
+        jobs=jobs,
+        timeout=args.timeout,
+    )
+
+    print(f"\nEngine {engine.name}, {len(plugin_names)} plugin(s), "
+          f"formats {'+'.join(formats)}, jobs {jobs}")
+    print(f"Output {output_dir}")
+
+    started = manifest.utc_now()
+
+    probe = triage.run_probe(plan, engine)
+    if not probe.ok and not args.force:
+        print("\nProbe failed, so the run would produce nothing useful.")
+        print(triage.probe_diagnosis(probe))
+        print("\nUse --force to run the plugins anyway.")
+        triage.cleanup_probe(plan)
+        return 4
+    triage.cleanup_probe(plan)
+    print("Probe ok.\n")
+
+    tasks = triage.build_tasks(plan, engine)
+    done = {"n": 0}
+    total = len(tasks)
+
+    def on_finish(result: scheduler.TaskResult) -> None:
+        done["n"] += 1
+        mark = "ok  " if result.ok else "FAIL"
+        print(f"  [{done['n']:>3}/{total}] {mark} {result.task.label} "
+              f"({result.duration:.1f}s, {result.output_bytes / 1024:.0f} KB)")
+
+    results = scheduler.run_tasks(
+        tasks, jobs=jobs, timeout=plan.timeout, on_finish=on_finish
+    )
+
+    outcomes = triage.collect_outcomes(plan, results)
+    pruned = triage.prune_empty_outputs(plan, outcomes)
+
+    manifest_path = triage.write_manifest(
+        plan, engine, outcomes,
+        kernels=scan.kernels, image_sha256=scan.sha256, started_utc=started,
+    )
+
+    succeeded = [o for o in outcomes if o.ok]
+    failed = [o for o in outcomes if not o.ok]
+
+    print(f"\n{len(succeeded)}/{len(outcomes)} plugin(s) succeeded.")
+    if pruned:
+        print(f"Removed {pruned} empty output file(s); logs kept.")
+    if failed:
+        print("\nFailed:")
+        for outcome in failed:
+            print(f"  {outcome.plugin}: {outcome.status()}")
+        print(f"\nPer-plugin logs: {output_dir / 'logs'}")
+    print(f"\nManifest {manifest_path}")
+
+    return 0 if not failed else 1
+
+
 def cmd_fetch_symbols(args: argparse.Namespace) -> int:
     """Download and convert the symbols a request asks for. Internet side."""
     from . import fetch
@@ -271,7 +402,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 #: Listed by doctor so a stale extract is obvious at a glance.
-_COMMANDS = ("symbols", "fetch-symbols", "verify", "doctor")
+_COMMANDS = ("triage", "symbols", "fetch-symbols", "verify", "doctor")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -282,6 +413,40 @@ def build_parser() -> argparse.ArgumentParser:
         "--version", action="version", version=f"v4ag {__version__} ({build_identity()})"
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    triage_cmd = sub.add_parser("triage", help="run plugins against a memory image")
+    triage_cmd.add_argument("--image", required=True, help="path to the memory image")
+    triage_cmd.add_argument("--symbols", default=None, help="symbols directory")
+    triage_cmd.add_argument("--out", default=None, help="output directory")
+    triage_cmd.add_argument("--output", default=None, help="where to write symbol_request.json")
+    triage_cmd.add_argument(
+        "--plugins", default=None,
+        help="comma-separated plugin names or categories (default: the triage set)",
+    )
+    triage_cmd.add_argument(
+        "--all", action="store_true", help="run every discovered Windows plugin"
+    )
+    triage_cmd.add_argument(
+        "--format", default="csv,json", help="output formats (default: csv,json)"
+    )
+    triage_cmd.add_argument(
+        "--jobs", default="1", help="plugins to run concurrently, or 'auto' (default: 1)"
+    )
+    triage_cmd.add_argument(
+        "--engine", default="auto", choices=["auto", "library", "exe"],
+        help="which Volatility to drive (default: auto)",
+    )
+    triage_cmd.add_argument(
+        "--timeout", type=float, default=3600.0, help="per-plugin timeout in seconds"
+    )
+    triage_cmd.add_argument(
+        "--no-hash", action="store_true", help="skip the custody SHA-256"
+    )
+    triage_cmd.add_argument(
+        "--force", action="store_true",
+        help="run even if symbols are missing or the probe fails",
+    )
+    triage_cmd.set_defaults(func=cmd_triage)
 
     symbols = sub.add_parser(
         "symbols", help="identify the kernel and report the symbols needed"
