@@ -435,3 +435,48 @@ class TestLauncherLineEndings:
         raw = target.read_bytes()
         assert b"\r\n" in raw
         assert raw.replace(b"\r\n", b"").count(b"\n") == 0
+
+
+class TestAtomicArchive:
+    """A partially written archive is worse than a failed one.
+
+    Copying it mid-build yields entry offsets that no longer match the data, so
+    extraction succeeds while placing one file's contents under another's name.
+    """
+
+    def test_no_part_file_is_left_behind(self, tmp_path) -> None:
+        root = make_tree(tmp_path / "Bundle", BASE)
+        archive = tmp_path / "out.zip"
+        bp.write_deterministic_zip(root, archive)
+
+        assert archive.is_file()
+        assert not archive.with_name(archive.name + ".part").exists()
+
+    def test_an_existing_archive_is_replaced_wholesale(self, tmp_path) -> None:
+        root = make_tree(tmp_path / "Bundle", BASE)
+        archive = tmp_path / "out.zip"
+        archive.write_bytes(b"stale content that must not survive")
+
+        bp.write_deterministic_zip(root, archive)
+
+        assert zipfile.is_zipfile(archive)
+        with zipfile.ZipFile(archive) as zf:
+            assert zf.testzip() is None
+
+    def test_the_archive_is_only_visible_once_complete(self, tmp_path, monkeypatch) -> None:
+        """Mid-write, the final name must not yet exist."""
+        root = make_tree(tmp_path / "Bundle", BASE)
+        archive = tmp_path / "out.zip"
+        seen = {}
+
+        real_copyfileobj = bp.shutil.copyfileobj
+
+        def spy(src, dst, length=None):
+            seen.setdefault("existed_during_write", archive.exists())
+            return real_copyfileobj(src, dst, length) if length else real_copyfileobj(src, dst)
+
+        monkeypatch.setattr(bp.shutil, "copyfileobj", spy)
+        bp.write_deterministic_zip(root, archive)
+
+        assert seen["existed_during_write"] is False
+        assert archive.is_file()

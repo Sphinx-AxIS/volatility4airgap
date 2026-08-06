@@ -215,6 +215,13 @@ def write_deterministic_zip(folder: Path, archive: Path) -> None:
     """
     archive.parent.mkdir(parents=True, exist_ok=True)
 
+    # Build to a temporary name and rename into place. Writing the archive directly
+    # means anyone copying it during a rebuild — a VM shared folder, a sync client,
+    # a USB copy — gets a partially written file. That does not fail loudly: the
+    # entry offsets no longer match the data, so extraction succeeds while placing
+    # one file's contents under another file's name.
+    staging = archive.with_name(archive.name + ".part")
+
     def arcname(path: Path) -> str:
         return str(Path(folder.name) / path.relative_to(folder)).replace("\\", "/")
 
@@ -229,7 +236,7 @@ def write_deterministic_zip(folder: Path, archive: Path) -> None:
         (arcname(p) + ("/" if p.is_dir() else ""), p) for p in folder.rglob("*")
     )
 
-    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+    with zipfile.ZipFile(staging, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for name, path in entries:
             info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
             if path.is_dir():
@@ -243,6 +250,8 @@ def write_deterministic_zip(folder: Path, archive: Path) -> None:
             # reading it whole would spike memory by that much.
             with path.open("rb") as source, zf.open(info, "w") as target:
                 shutil.copyfileobj(source, target, 1 << 20)
+
+    staging.replace(archive)
 
 
 def directory_stats(root: Path) -> tuple[int, int]:
@@ -429,7 +438,14 @@ def build(args: argparse.Namespace) -> Path:
         archive = out_root / f"{BUNDLE_NAME}.zip"
         log("archiving (deterministic: fixed timestamps, sorted entries)")
         write_deterministic_zip(bundle, archive)
+
+        digest = sha256_file(archive)
+        (archive.with_suffix(".zip.sha256")).write_text(
+            f"{digest}  {archive.name}\n", encoding="utf-8"
+        )
         log(f"archive: {archive} ({archive.stat().st_size / 1e6:.1f} MB)")
+        log(f"sha256 : {digest}")
+        log("verify after transfer:  certutil -hashfile Volatility4AirGap.zip SHA256")
 
     return bundle
 
