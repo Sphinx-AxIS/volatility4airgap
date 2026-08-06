@@ -24,6 +24,27 @@ def default_symbols_dir() -> Path:
     return BUNDLE_ROOT / "symbols"
 
 
+def build_identity() -> str:
+    """Identify which build this is, from BUILD-MANIFEST.json.
+
+    The tool version alone cannot distinguish two builds, so an analyst running a
+    stale extract gets no hint of it — only a command that does not exist yet.
+    The build time and payload digest make that self-diagnosing.
+    """
+    manifest = BUNDLE_ROOT / "BUILD-MANIFEST.json"
+    if not manifest.is_file():
+        return "source checkout"
+    try:
+        import json
+
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        built = data.get("built_utc", "?")
+        payload = str(data.get("payload_sha256", ""))[:8] or "?"
+        return f"built {built}, payload {payload}"
+    except (ValueError, OSError):
+        return "unreadable BUILD-MANIFEST.json"
+
+
 def _print_kernel(index: int, entry: dict, total: int) -> None:
     label = f"[{index}/{total}] " if total > 1 else ""
     print(f"\n{label}{entry['pdb_name']}  GUID {entry['guid']}  age {entry['age']}")
@@ -196,6 +217,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     print("Volatility4AirGap doctor")
     print(f"  tool          {__version__}")
+    print(f"  build         {build_identity()}")
+    print(f"  commands      {', '.join(sorted(_COMMANDS))}")
     print(f"  python        {platform.python_version()}")
     print(f"  interpreter   {interpreter_arch}  <- the bundle's architecture")
     print(f"  host cpu      {host_arch}")
@@ -247,11 +270,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+#: Listed by doctor so a stale extract is obvious at a glance.
+_COMMANDS = ("symbols", "fetch-symbols", "verify", "doctor")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="v4ag", description="Portable Volatility3 triage for air-gapped hosts"
     )
-    parser.add_argument("--version", action="version", version=f"v4ag {__version__}")
+    parser.add_argument(
+        "--version", action="version", version=f"v4ag {__version__} ({build_identity()})"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     symbols = sub.add_parser(

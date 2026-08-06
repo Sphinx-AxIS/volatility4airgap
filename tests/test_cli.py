@@ -11,6 +11,7 @@ run, fetch symbols if told to, run again.
 
 from __future__ import annotations
 
+import argparse
 import lzma
 import struct
 
@@ -198,3 +199,56 @@ class TestDoctor:
 
         assert code in (0, 1)
         assert "absent" in capsys.readouterr().out
+
+
+class TestBuildIdentity:
+    """A stale extract must be obvious rather than showing up as a missing command."""
+
+    def test_reports_source_checkout_without_a_manifest(self) -> None:
+        import app.__main__ as cli
+
+        assert cli.build_identity() == "source checkout"
+
+    def test_reads_build_time_and_payload_from_the_manifest(self, tmp_path, monkeypatch) -> None:
+        import json
+
+        import app.__main__ as cli
+
+        (tmp_path / "BUILD-MANIFEST.json").write_text(
+            json.dumps(
+                {"built_utc": "2026-08-06T04:00:00+00:00", "payload_sha256": "abcdef1234567890"}
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(cli, "BUNDLE_ROOT", tmp_path)
+
+        identity = cli.build_identity()
+        assert "2026-08-06T04:00:00+00:00" in identity
+        assert "abcdef12" in identity
+        assert "abcdef1234567890" not in identity, "digest should be abbreviated"
+
+    def test_a_corrupt_manifest_does_not_crash(self, tmp_path, monkeypatch) -> None:
+        import app.__main__ as cli
+
+        (tmp_path / "BUILD-MANIFEST.json").write_text("{ not json", encoding="utf-8")
+        monkeypatch.setattr(cli, "BUNDLE_ROOT", tmp_path)
+
+        assert "unreadable" in cli.build_identity()
+
+    def test_doctor_lists_every_command(self, capsys) -> None:
+        import app.__main__ as cli
+
+        main(["doctor"])
+        out = capsys.readouterr().out
+        for command in cli._COMMANDS:
+            assert command in out
+
+    def test_command_list_matches_the_parser(self) -> None:
+        """The advertised list must not drift from what the parser accepts."""
+        import app.__main__ as cli
+
+        parser = cli.build_parser()
+        subparsers = [
+            action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+        ][0]
+        assert set(subparsers.choices) == set(cli._COMMANDS)
