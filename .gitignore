@@ -1,0 +1,43 @@
+# Build outputs — all reproducible from tools/build_portable.py
+/build/
+/dist/
+*.zip
+
+# Vendored/downloaded binaries (fetched by the build script; see README)
+/vendor/
+/python/
+/lib/
+volatility3.exe
+
+# Symbol data — windows.zip is 800 MB, never commit
+/symbols/
+*.pdb
+*.json.xz
+
+# Run artifacts
+/output/
+/cache/
+symbol_request.json
+
+# Evidence — never commit memory images
+*.raw
+*.vmem
+*.mem
+*.dmp
+*.lime
+*.img
+*.bin
+*.elf
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS
+.DS_Store
+Thumbs.db
