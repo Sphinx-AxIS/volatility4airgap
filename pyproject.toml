@@ -16,7 +16,10 @@ dev = ["pytest>=8.0", "volatility3>=2.28"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-addopts = "-q"
+# Network tests are opt-in: the suite must pass on a machine with no connectivity.
+# Run the real Microsoft symbol-server round trip with: pytest -m network
+addopts = "-q -m 'not network'"
+markers = ["network: reaches the internet; deselected by default"]
 
 [tool.ruff]
 line-length = 100

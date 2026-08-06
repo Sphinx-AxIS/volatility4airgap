@@ -1,13 +1,15 @@
 """Command-line entry point.
 
-Stage 2 ships ``symbols`` and ``verify``, which is enough to exercise the whole
-bundle — interpreter, library path, scanner — on a real workstation. ``triage``
-and ``fetch-symbols`` arrive with Stage 3.
+The symbol half of the workflow is complete: ``symbols`` on the air-gapped host
+identifies what is needed, ``fetch-symbols`` on the connected host produces it,
+``verify`` confirms the result before the analyst walks back, and ``doctor``
+diagnoses a bundle that will not start. ``triage`` — running plugins — is next.
 """
 
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
@@ -83,6 +85,52 @@ def cmd_symbols(args: argparse.Namespace) -> int:
     print(f"  v4ag.bat fetch-symbols {destination.name}")
     print("then copy the resulting symbols folder back here and re-run this command.")
     return 3
+
+
+def cmd_fetch_symbols(args: argparse.Namespace) -> int:
+    """Download and convert the symbols a request asks for. Internet side."""
+    from . import fetch
+
+    request_path = Path(args.request).expanduser()
+    if not request_path.is_file():
+        print(f"error: request not found: {request_path}", file=sys.stderr)
+        return 2
+
+    try:
+        document = symbol_request.load(request_path)
+    except (ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    out_dir = Path(args.out).expanduser() if args.out else default_symbols_dir()
+    kernels = symbol_request.kernels_from(document, missing_only=not args.all)
+
+    if not kernels:
+        print("Nothing to fetch: every kernel in the request is already satisfied.")
+        return 0
+
+    image = document.get("image", {}).get("name", "unknown")
+    print(f"Fetching symbols for {len(kernels)} kernel(s) from {image}")
+    print(f"Writing to {out_dir}")
+
+    work_dir = out_dir.parent / ".fetch-work"
+    try:
+        results = fetch.fetch_all(kernels, out_dir, work_dir)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    succeeded = [r for r in results if r.ok]
+    failed = [r for r in results if not r.ok]
+
+    print(f"\n{len(succeeded)} of {len(results)} symbol file(s) ready.")
+    for result in failed:
+        print(f"  failed: {result.kernel.pdb_name} {result.kernel.guid} — {result.error}")
+
+    if succeeded:
+        print(f"\nCopy this folder to the air-gapped machine:\n  {out_dir}")
+        print("Then re-run the command that produced this request.")
+
+    return 0 if not failed else 1
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
@@ -221,6 +269,16 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("request", help="path to symbol_request.json")
     verify.add_argument("--symbols", default=None, help="symbols directory")
     verify.set_defaults(func=cmd_verify)
+
+    fetch_cmd = sub.add_parser(
+        "fetch-symbols", help="download and convert symbols (internet-connected side)"
+    )
+    fetch_cmd.add_argument("request", help="path to symbol_request.json")
+    fetch_cmd.add_argument("--out", default=None, help="where to write the symbols tree")
+    fetch_cmd.add_argument(
+        "--all", action="store_true", help="refetch every kernel, not only the missing"
+    )
+    fetch_cmd.set_defaults(func=cmd_fetch_symbols)
 
     doctor = sub.add_parser("doctor", help="report bundle health and import status")
     doctor.add_argument("--symbols", default=None, help="symbols directory")
