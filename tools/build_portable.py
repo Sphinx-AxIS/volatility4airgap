@@ -69,13 +69,24 @@ PTH_CONTENTS = f"""python{PYTHON_TAG}.zip
 import site
 """
 
-LAUNCHER_BAT = """@echo off
-rem Volatility4AirGap command-line entry point.
-rem Runs the bundled interpreter; nothing needs to be installed on this machine.
-setlocal
-"%~dp0python\\python.exe" -m app %*
-exit /b %ERRORLEVEL%
-"""
+# cmd.exe expects CRLF. A batch file written with Unix line endings parses
+# unreliably — it may appear to work and then fail in ways that point nowhere near
+# the cause. Built on macOS, so the endings must be forced rather than inherited.
+LAUNCHER_BAT = "\r\n".join([
+    "@echo off",
+    "rem Volatility4AirGap command-line entry point.",
+    "rem Runs the bundled interpreter; nothing needs to be installed on this machine.",
+    "setlocal",
+    'set "V4AG_PY=%~dp0python\\python.exe"',
+    'if not exist "%V4AG_PY%" (',
+    "    echo ERROR: bundled interpreter not found at %V4AG_PY%",
+    "    echo The bundle is incomplete. Re-extract it to a clean folder.",
+    "    exit /b 9",
+    ")",
+    '"%V4AG_PY%" -m app %*',
+    "exit /b %ERRORLEVEL%",
+    "",
+])
 
 
 def log(message: str) -> None:
@@ -340,7 +351,8 @@ def build(args: argparse.Namespace) -> Path:
 
     # 3. Our code and launcher
     copy_app(REPO_ROOT / "app", bundle / "app")
-    (bundle / "v4ag.bat").write_text(LAUNCHER_BAT, encoding="utf-8")
+    # newline="" so the CRLF above survives verbatim rather than being translated.
+    (bundle / "v4ag.bat").write_bytes(LAUNCHER_BAT.encode("ascii"))
     log("copied app/ and wrote v4ag.bat")
 
     # The reference has to travel with the bundle. An analyst on an air-gapped

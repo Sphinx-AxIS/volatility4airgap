@@ -396,3 +396,42 @@ class TestEmptyDirectoriesSurvive:
             names = zf.namelist()
 
         assert names.index("Bundle/app/") < names.index("Bundle/app/__main__.py")
+
+
+class TestLauncherLineEndings:
+    """cmd.exe expects CRLF.
+
+    The launcher is generated on macOS, so Unix endings are the default and must be
+    forced. An LF-only .bat parses unreliably and fails in ways that point nowhere
+    near the cause.
+    """
+
+    def test_every_line_ends_crlf(self) -> None:
+        data = bp.LAUNCHER_BAT.encode("ascii")
+        assert b"\r\n" in data
+        # No bare LF: every \n must be preceded by \r.
+        assert data.replace(b"\r\n", b"") .count(b"\n") == 0, "bare LF in launcher"
+
+    def test_it_is_ascii_with_no_bom(self) -> None:
+        """A BOM would be echoed by cmd as a stray character on the first line."""
+        data = bp.LAUNCHER_BAT.encode("ascii")
+        assert not data.startswith(b"\xef\xbb\xbf")
+        assert data.startswith(b"@echo off\r\n")
+
+    def test_it_still_invokes_the_bundled_interpreter(self) -> None:
+        assert "%~dp0python\\python.exe" in bp.LAUNCHER_BAT
+        assert "-m app %*" in bp.LAUNCHER_BAT
+
+    def test_it_guards_a_missing_interpreter(self) -> None:
+        """A truncated extract should say so, not fail obscurely."""
+        assert "if not exist" in bp.LAUNCHER_BAT
+        assert "Re-extract" in bp.LAUNCHER_BAT
+
+    def test_the_written_file_keeps_crlf(self, tmp_path) -> None:
+        """write_text would translate newlines per platform; write_bytes must not."""
+        target = tmp_path / "v4ag.bat"
+        target.write_bytes(bp.LAUNCHER_BAT.encode("ascii"))
+
+        raw = target.read_bytes()
+        assert b"\r\n" in raw
+        assert raw.replace(b"\r\n", b"").count(b"\n") == 0
