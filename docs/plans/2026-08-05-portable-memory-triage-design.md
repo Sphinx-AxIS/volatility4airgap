@@ -261,6 +261,44 @@ request. `verify` confirms a dropped-in `symbols/` folder satisfies the request 
 analyst returns to the air-gapped room, so a bad conversion costs seconds rather than a
 second round trip.
 
+### The conversion must set `database_name`
+
+Volatility resolves symbols by **two** mechanisms, and the faster one is not path-based.
+`load_windows_symbol_table` first queries its SQLite cache for the key
+
+```
+{pdb_name}|{GUID}|{age}          e.g. ntkrnlpa.pdb|BD8F451F...|1
+```
+
+and only if that misses does it attempt a download and then fall back to globbing the
+filesystem. The cache derives that key from each ISF's `metadata.windows.pdb.database`
+field.
+
+`PdbReader` defaults `database` to `unknown.pdb`. An ISF converted without
+`database_name=` is therefore keyed `unknown.pdb|GUID|age`, which never matches — so a
+correctly named, correctly placed symbol file still misses the fast path. Volatility then
+tries to download it, which on an air-gapped host means waiting for a network timeout on
+every single run before the path fallback rescues it.
+
+Confirmed empirically against `ntkrnlpa.pdb` from a real image: without `database_name` the
+key is `unknown.pdb|BD8F451F...|1`; with it, `ntkrnlpa.pdb|BD8F451F...|1`, matching what
+Volatility looks up. `KernelPdb.cache_identifier` encodes this, checked against
+`WindowsIdentifier.generate` in the differential tests.
+
+### Why the symbol pack needs the cache warmed
+
+The same investigation explains how the bundled 800 MB `windows.zip` is consumed.
+`file_symbol_url` takes two forms:
+
+- With a filename, it globs for a zip *named after the symbol* — which never matches
+  `windows.zip`.
+- With no filename, as the cache uses, it globs `*.zip` and indexes every ISF member.
+
+So the pack is only usable **through the cache**. The cache pre-warm already required for
+parallel runs is therefore not merely an optimisation to avoid `database is locked`; it is
+what makes the bundled pack work at all. Warming it must happen once, serially, before any
+plugin worker starts.
+
 ## Defects corrected
 
 **ISF filename (fatal).** `generate_isf.sh:46` extracts the 33-character `{GUID}{age}`

@@ -113,3 +113,49 @@ def test_url_and_isf_disagree_by_design() -> None:
     assert url_segment in pdb.download_url
     assert isf_segment in pdb.isf_relative_path
     assert url_segment not in pdb.isf_relative_path
+
+
+class TestCacheIdentifier:
+    """Volatility looks symbols up in its SQLite cache before globbing paths.
+
+    The cache key is built from the ISF's metadata.windows.pdb.database field.
+    PdbReader defaults that to "unknown.pdb", which never matches, so whatever
+    converts a PDB must pass database_name. These tests pin the key's shape
+    against volatility's own generator.
+    """
+
+    @pytest.mark.parametrize("age", [1, 2, 12])
+    @pytest.mark.parametrize("name", [n.decode() for n in KERNEL_PDB_NAMES])
+    def test_matches_upstream_generator(self, name: str, age: int) -> None:
+        from volatility3.framework.automagic.symbol_cache import WindowsIdentifier
+
+        pdb = KernelPdb(name, GOLDEN_GUID, age)
+        assert pdb.cache_identifier == WindowsIdentifier.generate(name, GOLDEN_GUID, age)
+
+    def test_identifier_uses_the_pdb_name_not_unknown(self) -> None:
+        pdb = KernelPdb(GOLDEN_NAME, GOLDEN_GUID, 1)
+        assert pdb.cache_identifier.startswith(GOLDEN_NAME.encode())
+        assert b"unknown.pdb" not in pdb.cache_identifier
+
+    def test_an_isf_with_the_default_database_would_not_match(self) -> None:
+        """Demonstrates the failure mode a converted ISF must avoid."""
+        from volatility3.framework.automagic.symbol_cache import WindowsIdentifier
+
+        wanted = KernelPdb(GOLDEN_NAME, GOLDEN_GUID, 1).cache_identifier
+        as_converted_by_default = WindowsIdentifier.generate("unknown.pdb", GOLDEN_GUID, 1)
+
+        assert as_converted_by_default != wanted
+
+    def test_identifier_read_back_from_isf_metadata(self) -> None:
+        """The round trip fetch-symbols must satisfy: write metadata, read key."""
+        from volatility3.framework.automagic.symbol_cache import WindowsIdentifier
+
+        pdb = KernelPdb(GOLDEN_NAME, GOLDEN_GUID, 3)
+        isf = {
+            "metadata": {
+                "windows": {
+                    "pdb": {"GUID": pdb.guid, "age": pdb.age, "database": pdb.pdb_name}
+                }
+            }
+        }
+        assert WindowsIdentifier.get_identifier(isf) == pdb.cache_identifier

@@ -130,6 +130,23 @@ class KernelPdb:
         """
         return f"windows/{self.pdb_name}/{self.guid}-{self.age}.json.xz"
 
+    @property
+    def cache_identifier(self) -> bytes:
+        """The key Volatility's symbol cache looks this kernel up by.
+
+        ``load_windows_symbol_table`` consults the SQLite cache *before* falling
+        back to a path glob, and builds this key from the scanned pdb name. The
+        cache indexes an ISF under whatever ``metadata.windows.pdb.database``
+        says, so a converted ISF must carry the real pdb name there.
+
+        ``PdbReader`` defaults that field to ``unknown.pdb``, which produces a key
+        that never matches. Anything converting a PDB must therefore pass
+        ``database_name=self.pdb_name``. Without it the fast path misses and
+        Volatility waits on a doomed download attempt before finding the file by
+        path — on an air-gapped host, a network timeout on every run.
+        """
+        return f"{self.pdb_name}|{self.guid.upper()}|{self.age}".encode("latin-1")
+
     def isf_path(self, symbols_dir: Path | str) -> Path:
         return Path(symbols_dir).joinpath(*self.isf_relative_path.split("/"))
 
