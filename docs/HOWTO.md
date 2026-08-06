@@ -10,7 +10,8 @@ Run everything through `v4ag.bat` from the bundle folder.
 
 ## Contents
 
-1. [The 60-second version](#the-60-second-version)
+1. [Extracting the bundle](#extracting-the-bundle)
+2. [The 60-second version](#the-60-second-version)
 2. [The two-machine workflow](#the-two-machine-workflow)
 3. [Command reference](#command-reference)
 4. [Choosing plugins](#choosing-plugins)
@@ -20,6 +21,35 @@ Run everything through `v4ag.bat` from the bundle folder.
 8. [Worked examples](#worked-examples)
 9. [Troubleshooting](#troubleshooting)
 10. [Why the symbol filename matters](#why-the-symbol-filename-matters)
+
+---
+
+## Extracting the bundle
+
+Prefer PowerShell over Explorer's right-click "Extract All":
+
+```powershell
+cd C:\vol3work
+certutil -hashfile Volatility4AirGap.zip SHA256    # compare with the .sha256 sidecar
+Expand-Archive -Path .\Volatility4AirGap.zip -DestinationPath . -Force
+```
+
+Explorer's built-in zip handling has been observed to extract this bundle
+incorrectly, placing one file's contents under another file's name — which then
+surfaces as an unrelated error somewhere downstream. `Expand-Archive` does not.
+
+Always verify the archive hash *before* extracting. A partial or corrupt copy extracts
+without complaint.
+
+Extract to a clean folder. If an older bundle is already there, delete it rather than
+merging — Explorer's "skip these files" prompt will silently keep stale copies.
+
+Confirm you have a current bundle: the folder should contain `cache`, `output` and
+`BUILD-FILES.sha256` alongside `app`, `lib`, `python` and `v4ag.bat`. Then:
+
+```bat
+v4ag.bat check
+```
 
 ---
 
@@ -397,9 +427,11 @@ The image is probably on slow or removable media. Every plugin streams the whole
 workers contend. Drop back to `--jobs 1`, or copy the image to local disk first.
 
 **A command prints gibberish, or `'{' is not recognized as an internal or external command`**
-A bundled file is corrupt — most likely `v4ag.bat` itself. Run `v4ag.bat check`, which
-names the offending file. If `v4ag.bat` is the damaged one it cannot check itself, so
-re-extract the bundle to a clean folder.
+A bundled file holds another file's contents. This has been seen with Explorer's built-in
+zip extractor; re-extract with `Expand-Archive` (see [Extracting the
+bundle](#extracting-the-bundle)) after verifying the archive hash. `v4ag.bat check` names
+the affected files — but if `v4ag.bat` is itself damaged it cannot run, so just re-extract
+to a clean folder.
 
 **Something is wrong and I do not know what**
 

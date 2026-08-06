@@ -36,6 +36,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 BUNDLE_NAME = "Volatility4AirGap"
 
+# Fixed so builds stay reproducible. Deliberately not the DOS epoch minimum
+# (1980-01-01), which is a boundary value some extractors handle poorly.
+ARCHIVE_TIMESTAMP = (2020, 1, 1, 0, 0, 0)
+
+# DOS attribute bytes, read by Windows extractors.
+DOS_ARCHIVE = 0x20
+DOS_DIRECTORY = 0x10
+
 # Pinned interpreter. The SHA-256 was verified against python.org's published MD5
 # for python-3.12.10-embed-amd64.zip (fe8ef205f2e9c3ba44d0cf9954e1abd3) before
 # being recorded here. Changing the version means re-verifying the same way.
@@ -238,14 +246,21 @@ def write_deterministic_zip(folder: Path, archive: Path) -> None:
 
     with zipfile.ZipFile(staging, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for name, path in entries:
-            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info = zipfile.ZipInfo(name, date_time=ARCHIVE_TIMESTAMP)
+
+            # Declare a Windows-created archive. ZipInfo defaults to 3 (Unix) when
+            # built off Windows, which makes extractors read external_attr as Unix
+            # mode bits. The target is Windows, so present DOS attributes on the
+            # path its extractors exercise most.
+            info.create_system = 0
+
             if path.is_dir():
-                info.external_attr = (0o755 << 16) | 0x10  # MS-DOS directory flag
+                info.external_attr = (0o755 << 16) | DOS_DIRECTORY
                 zf.writestr(info, b"")
                 continue
 
             info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = 0o644 << 16
+            info.external_attr = (0o644 << 16) | DOS_ARCHIVE
             # Streamed, not read_bytes(): the symbol pack alone is 800 MB and
             # reading it whole would spike memory by that much.
             with path.open("rb") as source, zf.open(info, "w") as target:

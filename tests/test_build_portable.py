@@ -147,7 +147,7 @@ class TestDeterministicZip:
         bp.write_deterministic_zip(a, archive)
 
         with zipfile.ZipFile(archive) as zf:
-            assert {i.date_time for i in zf.infolist()} == {(1980, 1, 1, 0, 0, 0)}
+            assert {i.date_time for i in zf.infolist()} == {bp.ARCHIVE_TIMESTAMP}
 
 
 class TestStripHostArtifacts:
@@ -480,3 +480,48 @@ class TestAtomicArchive:
 
         assert seen["existed_during_write"] is False
         assert archive.is_file()
+
+
+class TestWindowsExtractorCompatibility:
+    """The bundle is extracted on Windows, often by Explorer.
+
+    Explorer's zip handling is the least robust of the common extractors, so the
+    archive should present the metadata its usual path expects rather than relying
+    on everyone reaching for Expand-Archive.
+    """
+
+    def _archive(self, tmp_path):
+        root = make_tree(tmp_path / "Bundle", BASE)
+        (root / "cache").mkdir()
+        archive = tmp_path / "out.zip"
+        bp.write_deterministic_zip(root, archive)
+        return archive
+
+    def test_declares_a_windows_created_archive(self, tmp_path) -> None:
+        """create_system 3 (Unix) makes extractors read Unix mode bits instead."""
+        with zipfile.ZipFile(self._archive(tmp_path)) as zf:
+            assert {i.create_system for i in zf.infolist()} == {0}
+
+    def test_files_carry_the_dos_archive_attribute(self, tmp_path) -> None:
+        with zipfile.ZipFile(self._archive(tmp_path)) as zf:
+            info = zf.getinfo("Bundle/v4ag.bat")
+        assert info.external_attr & 0xFF == bp.DOS_ARCHIVE
+
+    def test_directories_carry_the_dos_directory_attribute(self, tmp_path) -> None:
+        with zipfile.ZipFile(self._archive(tmp_path)) as zf:
+            info = zf.getinfo("Bundle/cache/")
+        assert info.external_attr & 0xFF == bp.DOS_DIRECTORY
+
+    def test_avoids_the_dos_epoch_boundary(self, tmp_path) -> None:
+        """1980-01-01 is the minimum DOS timestamp and a common edge case."""
+        assert bp.ARCHIVE_TIMESTAMP[0] > 1980
+        with zipfile.ZipFile(self._archive(tmp_path)) as zf:
+            assert {i.date_time for i in zf.infolist()} == {bp.ARCHIVE_TIMESTAMP}
+
+    def test_still_deterministic(self, tmp_path) -> None:
+        root = make_tree(tmp_path / "Bundle", BASE)
+        (root / "cache").mkdir()
+        first, second = tmp_path / "a.zip", tmp_path / "b.zip"
+        bp.write_deterministic_zip(root, first)
+        bp.write_deterministic_zip(root, second)
+        assert first.read_bytes() == second.read_bytes()
