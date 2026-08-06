@@ -11,25 +11,40 @@ Installs nothing. Needs no Python on the target and no administrator rights.
 
 ## Status
 
-Design approved; implementation not yet started.
-See [docs/plans/2026-08-05-portable-memory-triage-design.md](docs/plans/2026-08-05-portable-memory-triage-design.md).
+Symbol identification and the portable bundle build are done. Plugin execution
+(`triage`, `--jobs`) is next.
+
+| | |
+| --- | --- |
+| `symbols` | working — identifies the kernel, reports URLs, writes `symbol_request.json` |
+| `verify` | working — checks a request is satisfied before you walk back |
+| `fetch-symbols` | not yet built |
+| `triage` | not yet built |
+
+Design: [docs/plans/2026-08-05-portable-memory-triage-design.md](docs/plans/2026-08-05-portable-memory-triage-design.md)
 
 ## The workflow
 
 On the air-gapped workstation:
 
 ```
-v4ag.bat triage --image E:\evidence\image.raw --jobs 4
+v4ag.bat symbols --image E:\evidence\image.raw
 ```
 
-If symbols are missing, the tool stops and writes `symbol_request.json` containing the
-download URL and the required ISF path. On an internet-connected machine:
-
 ```
-v4ag.bat fetch-symbols symbol_request.json
+ntkrnlmp.pdb  GUID AF550CAA73AFB287705CC40079D786B4  age 1
+  status    MISSING
+  download  http://msdl.microsoft.com/download/symbols/ntkrnlmp.pdb/AF550CAA73AFB287705CC40079D786B41/ntkrnlmp.pdb
+  fallback  http://msdl.microsoft.com/download/symbols/ntkrnlmp.pdb/AF550CAA73AFB287705CC40079D786B41/ntkrnlmp.pd_
+  place at  symbols/windows/ntkrnlmp.pdb/AF550CAA73AFB287705CC40079D786B4-1.json.xz
 ```
 
-Copy the resulting `symbols/` folder back, re-run the first command, and it proceeds.
+Note that the URL segment and the ISF filename are *not* the same string. The URL
+concatenates the GUID and age; the filename joins them with a hyphen. Getting this wrong
+produces a symbol file Volatility silently ignores.
+
+Copy the resulting `symbols/` folder back and re-run. Exit codes: `0` ready, `1` no kernel
+found, `2` bad input, `3` symbols missing.
 
 ## Building
 
@@ -38,9 +53,27 @@ The Windows x64 bundle is built on macOS or Linux. No Windows machine is require
 wheels, so nothing needs compiling.
 
 ```
-python3 tools/build_portable.py            # full bundle, ~820 MB with symbol pack
-python3 tools/build_portable.py --lean     # ~20 MB, no symbol pack
+python3 tools/build_portable.py                     # full bundle, ~875 MB with symbol pack
+python3 tools/build_portable.py --lean              # ~75 MB, no symbol pack
+python3 tools/build_portable.py --check build/...   # verify a bundle against its manifest
 ```
+
+Add `--vol-exe path/to/volatility3.exe` to include the official binary for the `exe`
+engine.
+
+The bundle contains an embedded CPython, so nothing is installed on the target and no
+administrator rights are needed. Two builds produce the same `payload_sha256`; the archive
+itself differs only by the build timestamp in `BUILD-MANIFEST.json`.
+
+## Tests
+
+```
+python3 -m pytest
+```
+
+The suite needs neither Windows nor a memory image. Where it matters, behaviour is checked
+against the real `volatility3` library rather than against our own assumptions — install
+the `dev` extra to enable those.
 
 ## Repository notes
 

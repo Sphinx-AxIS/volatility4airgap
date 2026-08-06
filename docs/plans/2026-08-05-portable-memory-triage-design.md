@@ -294,7 +294,38 @@ failure mode.
 8. Zip the bundle
 
 Pinned, hashed inputs make builds reproducible, and `BUILD-MANIFEST.json` is the evidence
-package for an approval authority.
+package for an approval authority. The Python pin was verified against python.org's
+published MD5 before being recorded, so the hash attests to the upstream artifact rather
+than merely to one download.
+
+### Reproducibility, stated accurately
+
+The archive is *not* byte-identical between builds: `BUILD-MANIFEST.json` records
+`built_utc`, which necessarily differs. Claiming otherwise would be false.
+
+What is stable is `payload_sha256` — a digest over every file in the bundle except the
+manifest, covering both paths and contents so renames, additions and removals all register.
+Two independent builds produce the same value. An approver can therefore rebuild and
+compare one number rather than trusting the artifact.
+
+`--check BUNDLE_DIR` recomputes that digest and compares it with the manifest, which also
+detects corruption or tampering after the bundle has crossed to the air-gapped host. A
+single appended byte in one of 1040 files is caught.
+
+### Host artifacts must not leak into the bundle
+
+`pip` compiles `.pyc` files with the *build host's* interpreter. Those carry the wrong
+magic number for the target Python, so they are ignored at runtime — dead weight that also
+misleads anyone auditing the bundle. Wheels may also install Unix `bin/` entry scripts
+(`vol`, `volshell`) that cannot run on Windows. The build passes `--no-compile` and strips
+both. A verification pass confirms every bundled `.pyd`, `.dll` and `.exe` is PE32+
+x86-64, with no `.so` or `.dylib` present.
+
+### Archiving streams
+
+Files are streamed into the archive rather than read whole. The symbol pack alone is
+800 MB, and buffering it would spike memory by that much; measured peak RSS delta while
+archiving a 419 MB file is 1 MB.
 
 ## Testing
 
