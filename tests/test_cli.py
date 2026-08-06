@@ -155,3 +155,46 @@ class TestParser:
     def test_a_subcommand_is_required(self) -> None:
         with pytest.raises(SystemExit):
             main([])
+
+
+class TestDoctor:
+    """Doctor exists to diagnose a host we cannot reach, so it must never crash."""
+
+    def test_reports_the_interpreter_architecture(self, capsys) -> None:
+        """The host CPU is not the process architecture; the bundle's arch is what matters."""
+        assert main(["doctor"]) in (0, 1)
+
+        out = capsys.readouterr().out
+        assert "interpreter" in out
+        assert "host cpu" in out
+
+    def test_reports_required_components(self, capsys) -> None:
+        main(["doctor"])
+        out = capsys.readouterr().out
+
+        for name in ("lzma", "sqlite3", "ssl", "hashlib", "pefile"):
+            assert name in out
+
+    def test_survives_a_missing_symbols_directory(self, tmp_path, capsys) -> None:
+        code = main(["doctor", "--symbols", str(tmp_path / "nope")])
+        assert code in (0, 1)
+        assert "missing" in capsys.readouterr().out
+
+    def test_reports_an_empty_symbols_directory(self, tmp_path, capsys) -> None:
+        (tmp_path / "symbols").mkdir()
+        main(["doctor", "--symbols", str(tmp_path / "symbols")])
+        assert "empty" in capsys.readouterr().out
+
+    def test_an_unimportable_optional_module_is_not_fatal(self, capsys) -> None:
+        """Optional components absent must not fail the check."""
+        import app.__main__ as cli
+
+        original = cli._OPTIONAL
+        cli._OPTIONAL = [("definitely_not_installed_xyz", "nonexistent")]
+        try:
+            code = main(["doctor"])
+        finally:
+            cli._OPTIONAL = original
+
+        assert code in (0, 1)
+        assert "absent" in capsys.readouterr().out

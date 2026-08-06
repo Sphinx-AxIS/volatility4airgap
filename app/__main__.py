@@ -137,11 +137,22 @@ def _probe(name: str) -> tuple[bool, str]:
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Report the bundle's health. Written for a host with no debugger and no network."""
     import platform
+    import sysconfig
+
+    # platform.machine() reports the host CPU, which under Windows-on-ARM x64
+    # emulation is ARM64 even though the process is x64. sysconfig.get_platform()
+    # reports what the interpreter was *built* for, which is the thing that decides
+    # whether this bundle can run here at all.
+    interpreter_arch = sysconfig.get_platform()
+    host_arch = platform.machine()
 
     print("Volatility4AirGap doctor")
     print(f"  tool          {__version__}")
-    print(f"  python        {platform.python_version()} ({platform.architecture()[0]})")
-    print(f"  machine       {platform.machine()}")
+    print(f"  python        {platform.python_version()}")
+    print(f"  interpreter   {interpreter_arch}  <- the bundle's architecture")
+    print(f"  host cpu      {host_arch}")
+    if interpreter_arch == "win-amd64" and host_arch.upper() == "ARM64":
+        print("                (x64 under ARM emulation: fine for testing, not the target)")
     print(f"  executable    {sys.executable}")
     print(f"  bundle root   {BUNDLE_ROOT}")
 
