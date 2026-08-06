@@ -18,6 +18,23 @@ from pathlib import Path
 
 from .symbols import KernelPdb
 
+#: An ISF with no user_types has symbol addresses but no structure definitions.
+#: Volatility cannot build a kernel symbol table from one, so it must not count as
+#: available — otherwise the tool reports "ready to run plugins" and every plugin
+#: then fails with an error that names a requirement rather than a cause.
+def isf_has_types(path: Path) -> bool:
+    """Whether a loose ISF carries the type information Volatility needs."""
+    import json
+    import lzma
+
+    try:
+        opener = lzma.open if path.suffix == ".xz" else open
+        with opener(path, "rt", encoding="utf-8") as handle:
+            document = json.load(handle)
+    except Exception:  # noqa: BLE001 - unreadable is as unusable as type-less
+        return False
+    return bool(document.get("user_types"))
+
 
 @dataclass(frozen=True)
 class Located:
@@ -26,6 +43,8 @@ class Located:
     kernel: KernelPdb
     container: Path
     member: str | None = None
+    usable: bool = True
+    reason: str | None = None
 
     @property
     def in_archive(self) -> bool:
@@ -72,6 +91,11 @@ class SymbolStore:
         """Return where this kernel's ISF lives, or ``None`` if it is absent."""
         loose = kernel.isf_path(self.root)
         if loose.is_file():
+            if not isf_has_types(loose):
+                return Located(
+                    kernel, loose, usable=False,
+                    reason="contains no type information (stripped PDB); unusable",
+                )
             return Located(kernel, loose)
 
         filename = kernel.isf_relative_path.rsplit("/", 1)[-1]
@@ -83,11 +107,17 @@ class SymbolStore:
         return None
 
     def has(self, kernel: KernelPdb) -> bool:
-        return self.locate(kernel) is not None
+        located = self.locate(kernel)
+        return located is not None and located.usable
 
     def missing(self, kernels: list[KernelPdb]) -> list[KernelPdb]:
         """Kernels with no ISF available, in the order given."""
         return [k for k in kernels if not self.has(k)]
+
+    def unusable(self, kernels: list[KernelPdb]) -> list[Located]:
+        """Symbols that exist but cannot be used, with the reason."""
+        found = [self.locate(k) for k in kernels]
+        return [loc for loc in found if loc is not None and not loc.usable]
 
     def invalidate(self) -> None:
         """Drop the cached archive index, after symbols have been added."""

@@ -35,12 +35,37 @@ SYMBOL_SERVER_URL = "http://msdl.microsoft.com/download/symbols"
 RSDS_MAGIC = b"RSDS"
 
 #: Kernel images vary by architecture and build; volatility scans for this set.
+#: Without one of these nothing runs at all.
 KERNEL_PDB_NAMES: tuple[bytes, ...] = (
     b"ntkrnlmp.pdb",
     b"ntkrnlpa.pdb",
     b"ntkrpamp.pdb",
     b"ntoskrnl.pdb",
 )
+
+#: Some plugins load symbols for a module other than the kernel, and would
+#: otherwise send Volatility to the symbol server mid-run — which on an air-gapped
+#: host means the plugin simply fails after the analyst believed everything was in
+#: place. Scanning for these up front keeps the trip across the gap to one.
+MODULE_PDB_NAMES: dict[bytes, tuple[str, ...]] = {
+    b"tcpip.pdb": ("windows.netstat.NetStat",),
+    b"cryptdll.pdb": ("windows.malware.skeleton_key_check.Skeleton_Key_Check",),
+}
+
+#: Everything worth looking for in one pass over the image.
+SCAN_PDB_NAMES: tuple[bytes, ...] = KERNEL_PDB_NAMES + tuple(MODULE_PDB_NAMES)
+
+_KERNEL_NAMES_LOWER = frozenset(n.lower() for n in KERNEL_PDB_NAMES)
+
+
+def is_kernel(pdb_name: str) -> bool:
+    """Whether this PDB is a kernel, and therefore required rather than optional."""
+    return pdb_name.lower().encode() in _KERNEL_NAMES_LOWER
+
+
+def needed_by(pdb_name: str) -> tuple[str, ...]:
+    """Plugins that require this non-kernel PDB. Empty for the kernel, which all need."""
+    return MODULE_PDB_NAMES.get(pdb_name.lower().encode(), ())
 
 # CV_INFO_PDB70: 'RSDS' (4) + GUID (16) + Age (4) + NUL-terminated name.
 _GUID_AGE = struct.Struct("<16sI")
@@ -222,7 +247,7 @@ def parse_rsds(buf: bytes, pos: int, *, allow_truncated: bool = False) -> Kernel
 def iter_rsds(
     stream: BinaryIO,
     *,
-    pdb_names: Iterable[bytes] | None = KERNEL_PDB_NAMES,
+    pdb_names: Iterable[bytes] | None = SCAN_PDB_NAMES,
     chunk_size: int = 8 << 20,
     digest: "hashlib._Hash | None" = None,
 ) -> Iterator[KernelPdb]:
@@ -300,9 +325,19 @@ def iter_rsds(
 class ScanResult:
     """What one pass over a memory image produced."""
 
-    kernels: list[KernelPdb]
+    entries: list[KernelPdb]
     bytes_read: int
     sha256: str | None = None
+
+    @property
+    def kernels(self) -> list[KernelPdb]:
+        """Kernel PDBs. Required: without one, no plugin runs."""
+        return [e for e in self.entries if is_kernel(e.pdb_name)]
+
+    @property
+    def modules(self) -> list[KernelPdb]:
+        """Non-kernel PDBs, each needed only by particular plugins."""
+        return [e for e in self.entries if not is_kernel(e.pdb_name)]
 
     @property
     def is_ambiguous(self) -> bool:
@@ -313,7 +348,7 @@ class ScanResult:
 def scan_image(
     path: Path | str,
     *,
-    pdb_names: Iterable[bytes] | None = KERNEL_PDB_NAMES,
+    pdb_names: Iterable[bytes] | None = SCAN_PDB_NAMES,
     chunk_size: int = 8 << 20,
     hash_image: bool = True,
 ) -> ScanResult:
@@ -331,13 +366,13 @@ def scan_image(
     digest = hashlib.sha256() if hash_image else None
 
     with open(path, "rb") as handle:
-        kernels = list(
+        entries = list(
             iter_rsds(handle, pdb_names=pdb_names, chunk_size=chunk_size, digest=digest)
         )
         bytes_read = handle.tell()
 
     return ScanResult(
-        kernels=kernels,
+        entries=entries,
         bytes_read=bytes_read,
         sha256=digest.hexdigest() if digest is not None else None,
     )

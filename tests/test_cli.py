@@ -45,11 +45,13 @@ def empty_image(tmp_path):
     return path
 
 
-def place_isf(symbols_dir, kernel: KernelPdb) -> None:
+def place_isf(symbols_dir, kernel: KernelPdb, *, with_types: bool = True) -> None:
+    from .test_symbol_store import isf_body
+
     path = kernel.isf_path(symbols_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     with lzma.open(path, "wt") as handle:
-        handle.write("{}")
+        handle.write(isf_body(kernel, with_types=with_types))
 
 
 class TestSymbolsCommand:

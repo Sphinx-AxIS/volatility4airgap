@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
-from .symbols import KernelPdb
+from .symbols import KernelPdb, is_kernel, needed_by
 from .symbol_store import SymbolStore
 
 SCHEMA_VERSION = 1
@@ -63,6 +63,11 @@ def build(
                     "compressed_fallback_url": kernel.compressed_url,
                 },
                 "required_isf": kernel.isf_relative_path,
+                # The kernel is required: without it nothing runs. Other modules are
+                # needed only by particular plugins, so a missing one degrades the
+                # run rather than blocking it.
+                "required": is_kernel(kernel.pdb_name),
+                "needed_by": list(needed_by(kernel.pdb_name)),
                 "present": located is not None,
                 "found_at": located.describe() if located is not None else None,
             }
@@ -80,6 +85,9 @@ def build(
         },
         "kernels": entries,
         "missing_count": sum(1 for e in entries if not e["present"]),
+        "missing_required_count": sum(
+            1 for e in entries if not e["present"] and e["required"]
+        ),
     }
 
 

@@ -166,3 +166,46 @@ class TestSchemaGuard:
 
         with pytest.raises(ValueError, match="missing its 'kernels' list"):
             symbol_request.load(path)
+
+
+class TestRequiredVersusOptional:
+    """A missing kernel blocks the run; a missing module only costs some plugins."""
+
+    def test_kernel_is_marked_required(self, image) -> None:
+        doc = symbol_request.build(
+            image, [KernelPdb("ntkrnlpa.pdb", GOLDEN_GUID, 1)], generated_utc=FIXED_TIME
+        )
+        assert doc["kernels"][0]["required"] is True
+        assert doc["kernels"][0]["needed_by"] == []
+
+    def test_module_is_marked_optional_with_its_plugins(self, image) -> None:
+        doc = symbol_request.build(
+            image, [KernelPdb("tcpip.pdb", GOLDEN_GUID, 2)], generated_utc=FIXED_TIME
+        )
+        entry = doc["kernels"][0]
+        assert entry["required"] is False
+        assert "windows.netstat.NetStat" in entry["needed_by"]
+
+    def test_missing_required_is_counted_separately(self, image) -> None:
+        doc = symbol_request.build(
+            image,
+            [
+                KernelPdb("ntkrnlpa.pdb", GOLDEN_GUID, 1),
+                KernelPdb("tcpip.pdb", OTHER_GUID, 2),
+            ],
+            generated_utc=FIXED_TIME,
+        )
+        assert doc["missing_count"] == 2
+        assert doc["missing_required_count"] == 1
+
+    def test_only_a_module_missing_leaves_required_count_zero(self, tmp_path, image) -> None:
+        symbols = tmp_path / "symbols"
+        kernel = KernelPdb("ntkrnlpa.pdb", GOLDEN_GUID, 1)
+        write_loose_isf(symbols, kernel)
+
+        doc = symbol_request.build(
+            image, [kernel, KernelPdb("tcpip.pdb", OTHER_GUID, 2)],
+            store=SymbolStore(symbols), generated_utc=FIXED_TIME,
+        )
+        assert doc["missing_required_count"] == 0
+        assert doc["missing_count"] == 1

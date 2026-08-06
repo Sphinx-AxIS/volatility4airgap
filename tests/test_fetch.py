@@ -28,11 +28,15 @@ def kernel() -> KernelPdb:
     return KernelPdb(GOLDEN_NAME, GOLDEN_GUID, 1)
 
 
-def write_isf(path, *, guid=GOLDEN_GUID, age=1, database=GOLDEN_NAME, symbols=None):
+def write_isf(path, *, guid=GOLDEN_GUID, age=1, database=GOLDEN_NAME, symbols=None,
+              user_types=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     document = {
         "metadata": {"windows": {"pdb": {"GUID": guid, "age": age, "database": database}}},
         "symbols": symbols if symbols is not None else {"a": {}, "b": {}},
+        "user_types": (
+            user_types if user_types is not None else {"_EPROCESS": {"kind": "struct"}}
+        ),
     }
     with lzma.open(path, "wt", encoding="utf-8") as handle:
         json.dump(document, handle)
@@ -222,3 +226,54 @@ class TestRealSymbolServer:
         with lzma.open(result.isf_path, "rt", encoding="utf-8") as handle:
             isf = json.load(handle)
         assert WindowsIdentifier.get_identifier(isf) == kernel.cache_identifier
+
+
+class TestStrippedPdbDetection:
+    """Microsoft serves public PDBs for some kernels — addresses, no structures.
+
+    The resulting ISF has the correct GUID, age and database, and is useless.
+    Volatility fails with "Unable to validate the plugin requirements:
+    ['plugins.Info.kernel.symbol_table_name']", which names a requirement rather
+    than a cause. Catching it at fetch time is the only place it is cheap.
+    """
+
+    def test_rejects_an_isf_with_no_types(self, tmp_path, kernel) -> None:
+        path = write_isf(kernel.isf_path(tmp_path), user_types={})
+        with pytest.raises(fetch.FetchError, match="no type information"):
+            fetch.verify_isf(path, kernel)
+
+    def test_the_message_points_at_the_symbol_pack(self, tmp_path, kernel) -> None:
+        path = write_isf(kernel.isf_path(tmp_path), user_types={})
+        with pytest.raises(fetch.FetchError, match="windows.zip"):
+            fetch.verify_isf(path, kernel)
+
+    def test_identity_alone_is_not_enough(self, tmp_path, kernel) -> None:
+        """Every identity field matches; only the types are absent."""
+        path = write_isf(
+            kernel.isf_path(tmp_path),
+            guid=kernel.guid, age=kernel.age, database=kernel.pdb_name,
+            user_types={},
+        )
+        with pytest.raises(fetch.FetchError):
+            fetch.verify_isf(path, kernel)
+
+    def test_an_unusable_isf_is_not_left_on_disk(self, tmp_path, kernel, monkeypatch) -> None:
+        """Leaving it would satisfy every presence check while nothing can run."""
+        out = tmp_path / "symbols"
+
+        def fake_download(*args, **kwargs):
+            source = tmp_path / "x.pdb"
+            source.write_bytes(b"MSVC pdb")
+            return source, False
+
+        monkeypatch.setattr(fetch, "download_pdb", fake_download)
+        monkeypatch.setattr(
+            fetch, "convert_to_isf",
+            lambda *a, **k: write_isf(kernel.isf_path(out), user_types={}),
+        )
+
+        result = fetch.fetch_one(kernel, out, tmp_path / "work", log=lambda *_: None)
+
+        assert not result.ok
+        assert "no type information" in result.error
+        assert not kernel.isf_path(out).exists()

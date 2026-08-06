@@ -47,13 +47,17 @@ def build_identity() -> str:
 
 def _print_kernel(index: int, entry: dict, total: int) -> None:
     label = f"[{index}/{total}] " if total > 1 else ""
-    print(f"\n{label}{entry['pdb_name']}  GUID {entry['guid']}  age {entry['age']}")
+    role = "required" if entry.get("required") else "optional"
+    print(f"\n{label}{entry['pdb_name']}  GUID {entry['guid']}  age {entry['age']}  [{role}]")
+
+    if entry.get("needed_by"):
+        print(f"  needed by {', '.join(entry['needed_by'])}")
 
     if entry["present"]:
         print(f"  status    available at {entry['found_at']}")
         return
 
-    print("  status    MISSING")
+    print("  status    MISSING" if entry.get("required") else "  status    missing")
     print(f"  download  {entry['download']['primary_url']}")
     print(f"  fallback  {entry['download']['compressed_fallback_url']}")
     print(f"  place at  symbols/{entry['required_isf']}")
@@ -75,9 +79,14 @@ def cmd_symbols(args: argparse.Namespace) -> int:
         print("The image may be a non-Windows capture, compressed, or truncated.")
         return 1
 
+    if result.modules:
+        print(
+            f"Also found {len(result.modules)} module PDB(s) needed by specific plugins."
+        )
+
     store = SymbolStore(symbols_dir)
     document = symbol_request.build(
-        image, result.kernels, store=store, image_sha256=result.sha256
+        image, result.entries, store=store, image_sha256=result.sha256
     )
 
     if result.sha256:
@@ -97,10 +106,18 @@ def cmd_symbols(args: argparse.Namespace) -> int:
         print("\nAll symbols available. Ready to run plugins.")
         return 0
 
+    degraded = [
+        e for e in document["kernels"] if not e["present"] and not e.get("required")
+    ]
+
     destination = Path(args.output) if args.output else Path.cwd() / symbol_request.FILENAME
     symbol_request.write(destination, document)
 
     print(f"\n{missing} of {total} symbol file(s) missing.")
+    if document.get("missing_required_count") == 0 and degraded:
+        print("The kernel is covered; only these plugins would be affected:")
+        for entry in degraded:
+            print(f"  {', '.join(entry['needed_by']) or entry['pdb_name']}")
     print(f"Wrote {destination}")
     print("\nOn an internet-connected machine, run:")
     print(f"  v4ag.bat fetch-symbols {destination.name}")
@@ -147,18 +164,31 @@ def cmd_triage(args: argparse.Namespace) -> int:
         print(f"SHA-256  {scan.sha256}")
 
     store = SymbolStore(symbols_dir)
-    missing = store.missing(scan.kernels)
-    if missing and not args.force:
+    missing_required = store.missing(scan.kernels)
+    missing_optional = store.missing(scan.modules)
+
+    if missing_required and not args.force:
         document = symbol_request.build(
-            image, scan.kernels, store=store, image_sha256=scan.sha256
+            image, scan.entries, store=store, image_sha256=scan.sha256
         )
         destination = Path(args.output or Path.cwd()) / symbol_request.FILENAME
         symbol_request.write(destination, document)
-        print(f"\n{len(missing)} symbol file(s) missing; not running plugins.")
-        for kernel in missing:
+        print(f"\n{len(missing_required)} kernel symbol file(s) missing; not running plugins.")
+        for kernel in missing_required:
             print(f"  {kernel.pdb_name}  {kernel.download_url}")
         print(f"\nWrote {destination}. Run 'fetch-symbols' on a connected machine.")
         return 3
+
+    if missing_optional:
+        # Not fatal: only certain plugins need these. Say which, so the result is
+        # not quietly incomplete.
+        from .symbols import needed_by as _needed_by
+
+        print("\nSome module symbols are missing. These plugins will fail:")
+        for kernel in missing_optional:
+            plugins_affected = ", ".join(_needed_by(kernel.pdb_name)) or "unknown"
+            print(f"  {kernel.pdb_name:14s} -> {plugins_affected}")
+        print("  Run 'symbols' and 'fetch-symbols' to collect them.")
 
     try:
         plugin_names = catalog.resolve(args.plugins, all_plugins=args.all)

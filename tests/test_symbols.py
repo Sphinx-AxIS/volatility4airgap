@@ -340,3 +340,68 @@ class TestHashDuringScan:
 
         assert len(found) == 1
         assert digest.hexdigest() == hashlib.sha256(data).hexdigest()
+
+
+class TestModulePdbs:
+    """Some plugins need symbols for a module other than the kernel.
+
+    windows.netstat.NetStat loads tcpip.pdb. Scanning only for kernel names meant
+    the tool reported everything available, then that plugin failed on the
+    air-gapped host — a second trip across the gap for something one scan could
+    have found.
+    """
+
+    def test_scan_set_covers_kernel_and_modules(self) -> None:
+        from app.symbols import KERNEL_PDB_NAMES, MODULE_PDB_NAMES, SCAN_PDB_NAMES
+
+        assert set(KERNEL_PDB_NAMES) <= set(SCAN_PDB_NAMES)
+        assert set(MODULE_PDB_NAMES) <= set(SCAN_PDB_NAMES)
+        assert b"tcpip.pdb" in SCAN_PDB_NAMES
+
+    def test_kernel_names_are_recognised(self) -> None:
+        from app.symbols import KERNEL_PDB_NAMES, is_kernel
+
+        assert all(is_kernel(n.decode()) for n in KERNEL_PDB_NAMES)
+
+    def test_module_names_are_not_kernels(self) -> None:
+        from app.symbols import MODULE_PDB_NAMES, is_kernel
+
+        assert not any(is_kernel(n.decode()) for n in MODULE_PDB_NAMES)
+
+    def test_needed_by_names_the_dependent_plugin(self) -> None:
+        from app.symbols import needed_by
+
+        assert "windows.netstat.NetStat" in needed_by("tcpip.pdb")
+        assert needed_by("ntkrnlmp.pdb") == ()
+
+    def test_scan_separates_kernels_from_modules(self, tmp_path) -> None:
+        kernel = rsds_record(GOLDEN_GUID, 1, "ntkrnlpa.pdb")
+        tcpip = rsds_record("0" * 31 + "1", 2, "tcpip.pdb")
+        data = bytearray(image_with(kernel, offset=1000, total=1 << 20))
+        data[60000 : 60000 + len(tcpip)] = tcpip
+
+        image = tmp_path / "image.raw"
+        image.write_bytes(bytes(data))
+
+        result = scan_image(image)
+        assert [k.pdb_name for k in result.kernels] == ["ntkrnlpa.pdb"]
+        assert [m.pdb_name for m in result.modules] == ["tcpip.pdb"]
+        assert len(result.entries) == 2
+
+    def test_module_pdbs_do_not_make_the_scan_ambiguous(self, tmp_path) -> None:
+        """Ambiguity means several kernel builds, not a kernel plus a module."""
+        kernel = rsds_record(GOLDEN_GUID, 1, "ntkrnlpa.pdb")
+        tcpip = rsds_record("0" * 31 + "1", 2, "tcpip.pdb")
+        data = bytearray(image_with(kernel, offset=1000, total=1 << 20))
+        data[60000 : 60000 + len(tcpip)] = tcpip
+
+        image = tmp_path / "image.raw"
+        image.write_bytes(bytes(data))
+
+        assert scan_image(image).is_ambiguous is False
+
+    def test_a_module_pdb_derives_the_same_urls(self) -> None:
+        """Nothing about the URL or ISF path is kernel-specific."""
+        tcpip = KernelPdb("tcpip.pdb", GOLDEN_GUID, 2)
+        assert tcpip.isf_relative_path == f"windows/tcpip.pdb/{GOLDEN_GUID}-2.json.xz"
+        assert f"/{GOLDEN_GUID}2/" in tcpip.download_url

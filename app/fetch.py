@@ -180,6 +180,22 @@ def verify_isf(path: Path, kernel: KernelPdb) -> int:
             "Volatility's cache lookup would miss this file."
         )
 
+    # Identity is not usability. Microsoft serves public (stripped) PDBs for some
+    # kernels — chiefly older ones — which carry symbol addresses but no structure
+    # definitions. The resulting ISF has the right GUID and age and is useless:
+    # Volatility cannot resolve _EPROCESS and fails with "Unable to validate the
+    # plugin requirements: ['plugins.Info.kernel.symbol_table_name']", which points
+    # nowhere near the cause.
+    if not isf.get("user_types"):
+        raise FetchError(
+            f"{path.name} contains no type information "
+            f"({len(isf.get('symbols', {}))} symbols, 0 user_types). Microsoft served a "
+            "public (stripped) PDB for this kernel, so the ISF cannot be used. "
+            "Use the Volatility community symbol pack instead: "
+            "https://downloads.volatilityfoundation.org/volatility3/symbols/windows.zip "
+            "— place it in the symbols folder, or build the bundle without --lean."
+        )
+
     return len(isf.get("symbols", {}))
 
 
@@ -203,7 +219,13 @@ def fetch_one(kernel: KernelPdb, out_dir: Path, work_dir: Path, *, log=print) ->
             pdb_path = expand_cab(pdb_path, work_dir, log=log)
 
         isf_path = convert_to_isf(pdb_path, kernel, out_dir, log=log)
-        count = verify_isf(isf_path, kernel)
+        try:
+            count = verify_isf(isf_path, kernel)
+        except FetchError:
+            # Do not leave an unusable ISF behind. It would satisfy every presence
+            # check and report "ready to run plugins" while nothing can run.
+            isf_path.unlink(missing_ok=True)
+            raise
     except FetchError as exc:
         log(f"    FAILED: {exc}")
         return FetchResult(kernel, error=str(exc))

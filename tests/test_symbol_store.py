@@ -20,11 +20,34 @@ def kernel() -> KernelPdb:
     return KernelPdb(GOLDEN_NAME, GOLDEN_GUID, 1)
 
 
-def write_loose_isf(root, kernel: KernelPdb) -> None:
+def isf_body(kernel: KernelPdb, *, with_types: bool = True) -> str:
+    """A minimally realistic ISF. Type information is what makes it usable."""
+    import json
+
+    return json.dumps(
+        {
+            "metadata": {
+                "windows": {
+                    "pdb": {
+                        "GUID": kernel.guid,
+                        "age": kernel.age,
+                        "database": kernel.pdb_name,
+                    }
+                }
+            },
+            "symbols": {"PsActiveProcessHead": {"address": 1}},
+            "user_types": {"_EPROCESS": {"kind": "struct", "size": 4}} if with_types else {},
+            "enums": {},
+            "base_types": {},
+        }
+    )
+
+
+def write_loose_isf(root, kernel: KernelPdb, *, with_types: bool = True) -> None:
     path = kernel.isf_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     with lzma.open(path, "wt") as handle:
-        handle.write("{}")
+        handle.write(isf_body(kernel, with_types=with_types))
 
 
 def write_pack(root, members: list[str], name: str = "windows.zip") -> None:
@@ -139,3 +162,32 @@ class TestCaching:
         store.invalidate()
 
         assert store.has(kernel)
+
+
+class TestUsability:
+    """Present is not the same as usable."""
+
+    def test_a_typeless_isf_does_not_count_as_available(self, tmp_path, kernel) -> None:
+        write_loose_isf(tmp_path, kernel, with_types=False)
+        store = SymbolStore(tmp_path)
+
+        assert not store.has(kernel)
+        assert store.missing([kernel]) == [kernel]
+
+    def test_it_is_reported_with_a_reason(self, tmp_path, kernel) -> None:
+        write_loose_isf(tmp_path, kernel, with_types=False)
+        (unusable,) = SymbolStore(tmp_path).unusable([kernel])
+
+        assert unusable.usable is False
+        assert "no type information" in unusable.reason
+
+    def test_a_usable_isf_is_not_flagged(self, tmp_path, kernel) -> None:
+        write_loose_isf(tmp_path, kernel)
+        assert SymbolStore(tmp_path).unusable([kernel]) == []
+
+    def test_a_corrupt_isf_is_treated_as_unusable(self, tmp_path, kernel) -> None:
+        path = kernel.isf_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"not lzma")
+
+        assert not SymbolStore(tmp_path).has(kernel)
