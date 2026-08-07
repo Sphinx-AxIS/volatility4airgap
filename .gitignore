@@ -14,10 +14,16 @@ volatility3.exe
 *.pdb
 *.json.xz
 
-# Run artifacts
+# Run artifacts and case material — NEVER COMMIT.
+# Plugin output names processes, users, hostnames and network peers from the
+# examined host. Treat everything below as evidence, not as build output.
 /output/
 /cache/
 symbol_request.json
+*symbol*request*.json
+*check_output.txt
+/notes/
+/cases/
 
 # Evidence — never commit memory images
 *.raw
@@ -28,6 +34,19 @@ symbol_request.json
 *.img
 *.bin
 *.elf
+*.vhd
+*.vhdx
+*.e01
+*.aff4
+
+# Binaries extracted from evidence for local symbol generation.
+# This project is pure Python, so no compiled artifact belongs in it.
+/bin/
+*.exe
+*.dll
+*.sys
+*.sct
+*.hta
 
 # Python
 __pycache__/
