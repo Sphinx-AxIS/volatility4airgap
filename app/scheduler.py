@@ -103,6 +103,14 @@ def run_tasks(
     running: list[_Running] = []
     results: dict[str, TaskResult] = {}
 
+    # Children write to files, and a redirected stdout on Windows defaults to the
+    # ANSI code page (cp1252). Memory images contain arbitrary Unicode — foreign
+    # filenames, object names, plain garbage — and one unencodable character kills
+    # the plugin mid-write. Forcing UTF-8 with 'replace' turns that crash into a
+    # U+FFFD in the output. A caller-supplied env may still override this.
+    child_env = {**os.environ, **(env or {})}
+    child_env.setdefault("PYTHONIOENCODING", "utf-8:replace")
+
     def launch(task: Task) -> None:
         task.stdout_path.parent.mkdir(parents=True, exist_ok=True)
         task.stderr_path.parent.mkdir(parents=True, exist_ok=True)
@@ -114,7 +122,7 @@ def run_tasks(
             return
 
         try:
-            process = subprocess.Popen(task.command, stdout=out, stderr=err, env=env)
+            process = subprocess.Popen(task.command, stdout=out, stderr=err, env=child_env)
         except OSError as exc:
             out.close()
             err.close()
