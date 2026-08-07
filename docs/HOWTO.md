@@ -427,6 +427,18 @@ Check the folder landed in the right place. The tool expects
 `symbols\windows\<pdb name>\<GUID>-<age>.json.xz`. `v4ag.bat verify symbol_request.json`
 answers this definitively.
 
+**`fetch-symbols` reports some records as `unavailable` (HTTP 404)**
+Not every record the scan finds is real. The scan reads raw physical memory, so it
+also surfaces stale copies — freed pages from before an update, update payloads,
+cached file data — and Microsoft's server has no PDB for some of those GUIDs. This
+is expected and harmless: Volatility asks for exactly one kernel identity (read from
+the mapped kernel, which the probe validates) and one identity per module. As long
+as `fetch-symbols` ends with "Every module Volatility can ask for is covered", the
+404s cost nothing. If a specific module build genuinely matters and is not on the
+server, extract the matching binary from the host's disk and convert it locally:
+`python -m volatility3.framework.symbols.windows.pdbconv -f <binary>`, then place
+the compressed result at the `place at` path printed by `symbols`.
+
 **`fetch-symbols` cannot reach Microsoft**
 The URL is printed by `symbols`, so you can fetch the PDB with a browser on any machine.
 The tool also prints a `.pd_` fallback URL; that variant is a Microsoft cabinet and needs

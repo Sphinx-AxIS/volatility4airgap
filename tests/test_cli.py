@@ -23,18 +23,34 @@ from app.symbols import RSDS_MAGIC, KernelPdb, encode_guid
 from .test_symbols import GOLDEN_AGE, GOLDEN_GUID, GOLDEN_NAME
 
 
+def rsds_record(name: str, guid: str, age: int) -> bytes:
+    return RSDS_MAGIC + encode_guid(guid) + struct.pack("<I", age) + name.encode() + b"\x00"
+
+
 @pytest.fixture
 def image(tmp_path):
-    record = (
-        RSDS_MAGIC
-        + encode_guid(GOLDEN_GUID)
-        + struct.pack("<I", GOLDEN_AGE)
-        + GOLDEN_NAME.encode()
-        + b"\x00"
-    )
+    record = rsds_record(GOLDEN_NAME, GOLDEN_GUID, GOLDEN_AGE)
     path = tmp_path / "image.raw"
     total, offset = 1 << 20, 4096
     path.write_bytes(b"\xcc" * offset + record + b"\xcc" * (total - offset - len(record)))
+    return path
+
+
+#: A kernel-named RSDS record that exists nowhere on Microsoft's symbol server.
+#: Physical scans surface these routinely — freed pages from an older build, an
+#: update payload, cached file data — and they must never block a run.
+PHANTOM_GUID = "F" * 32
+
+
+@pytest.fixture
+def image_with_phantom(tmp_path):
+    real = rsds_record(GOLDEN_NAME, GOLDEN_GUID, GOLDEN_AGE)
+    phantom = rsds_record("ntoskrnl.pdb", PHANTOM_GUID, 1)
+    blob = bytearray(b"\xcc" * (1 << 20))
+    blob[4096 : 4096 + len(real)] = real
+    blob[8192 : 8192 + len(phantom)] = phantom
+    path = tmp_path / "image.raw"
+    path.write_bytes(bytes(blob))
     return path
 
 
@@ -112,6 +128,23 @@ class TestSymbolsCommand:
         assert code == 1
         assert "No Windows kernel PDB record found" in capsys.readouterr().out
 
+    def test_covered_kernel_ignores_phantom_records(
+        self, tmp_path, image_with_phantom, capsys
+    ) -> None:
+        """One usable kernel ISF satisfies the run; extra kernel-named records
+        scanned out of physical memory must not send the analyst fetching PDBs
+        Microsoft never published."""
+        symbols = tmp_path / "symbols"
+        place_isf(symbols, KernelPdb(GOLDEN_NAME, GOLDEN_GUID, GOLDEN_AGE))
+        request = tmp_path / "symbol_request.json"
+
+        code = main(["symbols", "--image", str(image_with_phantom),
+                     "--symbols", str(symbols), "--output", str(request)])
+
+        assert code == 0
+        assert request.is_file()  # still written, for optional best-effort fetching
+        assert "optional" in capsys.readouterr().out
+
     def test_no_request_written_when_nothing_missing(self, tmp_path, image) -> None:
         symbols = tmp_path / "symbols"
         place_isf(symbols, KernelPdb(GOLDEN_NAME, GOLDEN_GUID, GOLDEN_AGE))
@@ -136,7 +169,7 @@ class TestVerifyCommand:
         assert code == 0
         assert "Safe to return to the secure host" in capsys.readouterr().out
 
-    def test_reports_still_missing(self, tmp_path, image, capsys) -> None:
+    def test_reports_no_kernel_available(self, tmp_path, image, capsys) -> None:
         request = tmp_path / "symbol_request.json"
         symbols = tmp_path / "symbols"
         main(["symbols", "--image", str(image), "--symbols", str(symbols),
@@ -145,7 +178,21 @@ class TestVerifyCommand:
         code = main(["verify", str(request), "--symbols", str(symbols)])
 
         assert code == 3
-        assert "still missing" in capsys.readouterr().out
+        assert "Volatility cannot run" in capsys.readouterr().out
+
+    def test_covered_kernel_passes_despite_phantom_records(
+        self, tmp_path, image_with_phantom, capsys
+    ) -> None:
+        request = tmp_path / "symbol_request.json"
+        symbols = tmp_path / "symbols"
+        main(["symbols", "--image", str(image_with_phantom),
+              "--symbols", str(symbols), "--output", str(request)])
+
+        place_isf(symbols, KernelPdb(GOLDEN_NAME, GOLDEN_GUID, GOLDEN_AGE))
+        code = main(["verify", str(request), "--symbols", str(symbols)])
+
+        assert code == 0
+        assert "Safe to return to the secure host" in capsys.readouterr().out
 
 
 class TestParser:

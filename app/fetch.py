@@ -36,7 +36,18 @@ TIMEOUT_SECONDS = 300
 
 
 class FetchError(RuntimeError):
-    """A kernel's symbols could not be produced. Never fatal to the whole run."""
+    """A kernel's symbols could not be produced. Never fatal to the whole run.
+
+    ``unavailable`` marks the specific case where Microsoft's server returned 404
+    for both the .pdb and .pd_ variants: the GUID does not correspond to any build
+    Microsoft ever published. A physical-memory scan surfaces such records
+    routinely — freed pages from before an update, update payloads, cached file
+    data — and no amount of retrying will ever produce a PDB for them.
+    """
+
+    def __init__(self, message: str = "", *, unavailable: bool = False) -> None:
+        super().__init__(message)
+        self.unavailable = unavailable
 
 
 @dataclass
@@ -46,6 +57,8 @@ class FetchResult:
     error: str | None = None
     compressed: bool = False
     symbol_count: int = 0
+    #: Microsoft has no PDB for this identity (404 on both variants).
+    unavailable: bool = False
 
     @property
     def ok(self) -> bool:
@@ -70,26 +83,47 @@ def download_pdb(kernel: KernelPdb, work_dir: Path, *, log=print) -> tuple[Path,
     ]
 
     errors = []
+    all_not_found = True
     for url, filename, compressed in attempts:
         destination = work_dir / filename
         try:
             log(f"    GET {url}")
             with _open(url) as response, open(destination, "wb") as out:
                 shutil.copyfileobj(response, out)
-        except (urllib.error.HTTPError, urllib.error.URLError, OSError) as exc:
+        except urllib.error.HTTPError as exc:
+            errors.append(f"{filename}: HTTP {exc.code}")
+            if exc.code != 404:
+                all_not_found = False
+            destination.unlink(missing_ok=True)
+            continue
+        except (urllib.error.URLError, OSError) as exc:
             errors.append(f"{filename}: {exc}")
+            all_not_found = False
             destination.unlink(missing_ok=True)
             continue
 
         size = destination.stat().st_size
         if size == 0:
             errors.append(f"{filename}: empty response")
+            all_not_found = False
             destination.unlink(missing_ok=True)
             continue
 
         log(f"    {size / 1e6:.2f} MB")
         return destination, compressed
 
+    if errors and all_not_found:
+        raise FetchError(
+            "not on Microsoft's symbol server (HTTP 404 for both .pdb and .pd_). "
+            "This identity was scanned out of raw physical memory and is most "
+            "likely a stale or coincidental record — an old build's freed pages, "
+            "an update payload, or cached file data — not the module Volatility "
+            "will actually ask for. If a plugin genuinely needs this exact build, "
+            "extract the matching binary from the host's disk and convert it "
+            "locally: python -m volatility3.framework.symbols.windows.pdbconv "
+            "-f <binary>",
+            unavailable=True,
+        )
     raise FetchError("; ".join(errors) or "no download succeeded")
 
 
@@ -241,8 +275,8 @@ def fetch_one(kernel: KernelPdb, out_dir: Path, work_dir: Path, *, log=print) ->
             isf_path.unlink(missing_ok=True)
             raise
     except FetchError as exc:
-        log(f"    FAILED: {exc}")
-        return FetchResult(kernel, error=str(exc))
+        log(f"    {'UNAVAILABLE' if exc.unavailable else 'FAILED'}: {exc}")
+        return FetchResult(kernel, error=str(exc), unavailable=exc.unavailable)
     except Exception as exc:  # noqa: BLE001 - one kernel must not sink the run
         log(f"    FAILED: {type(exc).__name__}: {exc}")
         return FetchResult(kernel, error=f"{type(exc).__name__}: {exc}")

@@ -15,7 +15,7 @@ from pathlib import Path
 
 from . import __version__, symbol_request
 from .symbol_store import SymbolStore
-from .symbols import scan_image
+from .symbols import is_kernel, scan_image
 
 BUNDLE_ROOT = Path(__file__).resolve().parent.parent
 
@@ -106,19 +106,51 @@ def cmd_symbols(args: argparse.Namespace) -> int:
         print("\nAll symbols available. Ready to run plugins.")
         return 0
 
-    degraded = [
-        e for e in document["kernels"] if not e["present"] and not e.get("required")
-    ]
+    # Volatility needs exactly one kernel ISF: it scans the mapped kernel's
+    # virtual space and asks for that single identity. Extra kernel-named records
+    # in a physical scan are stale or coincidental copies, and some of those GUIDs
+    # were never published by Microsoft — fetching them can only ever 404.
+    kernel_covered = any(
+        e["present"] for e in document["kernels"] if e.get("required")
+    )
+
+    # Module names for which no copy at all is available; a present copy of the
+    # same name usually satisfies the plugin, since the loaded driver is the copy
+    # most likely to still be intact in memory.
+    by_name: dict[str, list[dict]] = {}
+    for e in document["kernels"]:
+        if not e.get("required"):
+            by_name.setdefault(e["pdb_name"], []).append(e)
+    uncovered_modules = {
+        name: entries for name, entries in by_name.items()
+        if not any(x["present"] for x in entries)
+    }
 
     destination = Path(args.output) if args.output else Path.cwd() / symbol_request.FILENAME
     symbol_request.write(destination, document)
 
     print(f"\n{missing} of {total} symbol file(s) missing.")
-    if document.get("missing_required_count") == 0 and degraded:
-        print("The kernel is covered; only these plugins would be affected:")
-        for entry in degraded:
-            print(f"  {', '.join(entry['needed_by']) or entry['pdb_name']}")
     print(f"Wrote {destination}")
+
+    if kernel_covered and not uncovered_modules:
+        print("\nThe kernel symbol Volatility will use is already available, and every")
+        print("module has at least one copy covered. The remaining records are extra")
+        print("copies found in physical memory (old builds, update payloads, cached")
+        print("data); some may not exist on Microsoft's server at all. Fetching them")
+        print("is optional — 'triage' can run now.")
+        return 0
+
+    if kernel_covered:
+        print("\nThe kernel is covered; only these plugins would be affected:")
+        for name, entries in uncovered_modules.items():
+            plugins = {p for e in entries for p in e.get("needed_by", [])}
+            print(f"  {', '.join(sorted(plugins)) or name}")
+        print("\nTo collect them, on an internet-connected machine run:")
+        print(f"  v4ag.bat fetch-symbols {destination.name}")
+        print("then copy the resulting symbols folder back here. 'triage' can run now")
+        print("either way; those plugins are skipped-in-effect until the symbols land.")
+        return 0
+
     print("\nOn an internet-connected machine, run:")
     print(f"  v4ag.bat fetch-symbols {destination.name}")
     print("then copy the resulting symbols folder back here and re-run this command.")
@@ -164,31 +196,63 @@ def cmd_triage(args: argparse.Namespace) -> int:
         print(f"SHA-256  {scan.sha256}")
 
     store = SymbolStore(symbols_dir)
-    missing_required = store.missing(scan.kernels)
+    kernels_present = [k for k in scan.kernels if store.has(k)]
+    missing_kernels = store.missing(scan.kernels)
     missing_optional = store.missing(scan.modules)
 
-    if missing_required and not args.force:
+    # A physical scan surfaces every kernel-named RSDS record in RAM, including
+    # stale copies from before an update and coincidental data. Volatility itself
+    # scans only the mapped kernel's virtual space and will ask for exactly one
+    # identity — so one usable kernel ISF is the requirement, and the probe below
+    # proves it is the right one. Demanding all of them blocks the run on records
+    # Microsoft's server has never heard of.
+    if not kernels_present and not args.force:
         document = symbol_request.build(
             image, scan.entries, store=store, image_sha256=scan.sha256
         )
         destination = Path(args.output or Path.cwd()) / symbol_request.FILENAME
         symbol_request.write(destination, document)
-        print(f"\n{len(missing_required)} kernel symbol file(s) missing; not running plugins.")
-        for kernel in missing_required:
+        print(f"\nNo usable kernel symbol file for any of the {len(scan.kernels)} "
+              "kernel record(s) found; not running plugins.")
+        for kernel in missing_kernels:
             print(f"  {kernel.pdb_name}  {kernel.download_url}")
         print(f"\nWrote {destination}. Run 'fetch-symbols' on a connected machine.")
         return 3
 
+    if missing_kernels and kernels_present:
+        print(f"\nNote: {len(missing_kernels)} other kernel-named record(s) in the "
+              "image have no symbol file. These are usually stale copies in memory; "
+              "the probe will confirm the symbols present match the running kernel.")
+
     if missing_optional:
         # Not fatal: only certain plugins need these. Say which, so the result is
-        # not quietly incomplete.
+        # not quietly incomplete. Warn hard only for module names with no copy at
+        # all — when one copy is present, the run itself will show whether it was
+        # the one the loaded driver wanted.
         from .symbols import needed_by as _needed_by
 
-        print("\nSome module symbols are missing. These plugins will fail:")
-        for kernel in missing_optional:
-            plugins_affected = ", ".join(_needed_by(kernel.pdb_name)) or "unknown"
-            print(f"  {kernel.pdb_name:14s} -> {plugins_affected}")
-        print("  Run 'symbols' and 'fetch-symbols' to collect them.")
+        by_name: dict[str, list] = {}
+        for kernel in scan.modules:
+            by_name.setdefault(kernel.pdb_name.lower(), []).append(kernel)
+
+        uncovered = {
+            name: ks for name, ks in by_name.items()
+            if not any(store.has(k) for k in ks)
+        }
+        if uncovered:
+            print("\nSome module symbols are missing. These plugins will fail:")
+            for name, ks in uncovered.items():
+                plugins_affected = ", ".join(_needed_by(name)) or "unknown"
+                print(f"  {name:14s} -> {plugins_affected}")
+            print("  Run 'symbols' and 'fetch-symbols' to collect them.")
+        partially = sorted(
+            name for name, ks in by_name.items()
+            if name not in uncovered and any(not store.has(k) for k in ks)
+        )
+        if partially:
+            print("\nNote: extra in-memory copies of "
+                  f"{', '.join(partially)} have no symbol file; if the plugin that "
+                  "needs the module fails, it wanted one of those copies.")
 
     try:
         plugin_names = catalog.resolve(args.plugins, all_plugins=args.all)
@@ -324,17 +388,49 @@ def cmd_fetch_symbols(args: argparse.Namespace) -> int:
         shutil.rmtree(work_dir, ignore_errors=True)
 
     succeeded = [r for r in results if r.ok]
-    failed = [r for r in results if not r.ok]
+    unavailable = [r for r in results if not r.ok and r.unavailable]
+    failed = [r for r in results if not r.ok and not r.unavailable]
 
     print(f"\n{len(succeeded)} of {len(results)} symbol file(s) ready.")
     for result in failed:
         print(f"  failed: {result.kernel.pdb_name} {result.kernel.guid} — {result.error}")
+    for result in unavailable:
+        print(f"  unavailable: {result.kernel.pdb_name} {result.kernel.guid} — "
+              "not on Microsoft's symbol server")
+
+    if unavailable:
+        print("\n'Unavailable' means Microsoft returned 404 for both the .pdb and .pd_")
+        print("variants: no build with that GUID was ever published. Such records come")
+        print("out of a physical-memory scan routinely (stale pages, update payloads,")
+        print("cached data) and are not the copies Volatility asks for at run time.")
+
+    # What matters is coverage, not a clean sweep: Volatility needs one kernel
+    # ISF, and one copy per module name is normally the loaded one. Judge the trip
+    # back on that, counting both what was already present and what just landed.
+    covered = {
+        e["pdb_name"].lower() for e in document["kernels"] if e.get("present")
+    }
+    covered |= {r.kernel.pdb_name.lower() for r in succeeded}
+    all_names = {e["pdb_name"].lower() for e in document["kernels"]}
+    kernel_covered = any(is_kernel(name) for name in covered)
+    uncovered = sorted(
+        name for name in all_names if not is_kernel(name) and name not in covered
+    )
 
     if succeeded:
         print(f"\nCopy this folder to the air-gapped machine:\n  {out_dir}")
         print("Then re-run the command that produced this request.")
 
-    return 0 if not failed else 1
+    if not kernel_covered:
+        print("\nNo kernel symbol file could be produced; Volatility cannot run.")
+        return 1
+    if uncovered:
+        print("\nNo copy could be produced for: " + ", ".join(uncovered) + ".")
+        print("Only the plugins that need those modules are affected.")
+    if failed:
+        return 1
+    print("\nEvery module Volatility can ask for is covered. Ready to run plugins.")
+    return 0
 
 
 FILELIST_NAME = "BUILD-FILES.sha256"
@@ -417,11 +513,36 @@ def cmd_verify(args: argparse.Namespace) -> int:
         state = f"ok       {located.describe()}" if located else "MISSING"
         print(f"{kernel.pdb_name}  {kernel.guid}-{kernel.age}  {state}")
 
-    if missing:
-        print(f"\n{len(missing)} of {len(kernels)} still missing under {symbols_dir}")
+    if not missing:
+        print(f"\nAll {len(kernels)} symbol file(s) present. Safe to return to the secure host.")
+        return 0
+
+    # The trip back is judged on coverage: one usable kernel ISF, and one copy per
+    # module name. Records beyond that are stale or coincidental copies from the
+    # physical scan, some of which Microsoft never published — they can stay
+    # missing forever without affecting the run.
+    kernel_candidates = [k for k in kernels if is_kernel(k.pdb_name)]
+    kernel_covered = any(store.has(k) for k in kernel_candidates)
+    module_names = {k.pdb_name.lower() for k in kernels if not is_kernel(k.pdb_name)}
+    covered_modules = {
+        k.pdb_name.lower() for k in kernels
+        if not is_kernel(k.pdb_name) and store.has(k)
+    }
+    uncovered_modules = sorted(module_names - covered_modules)
+
+    print(f"\n{len(missing)} of {len(kernels)} record(s) have no symbol file under {symbols_dir}")
+
+    if kernel_candidates and not kernel_covered:
+        print("No kernel symbol file is available; Volatility cannot run. Fetch at")
+        print("least one kernel ISF before returning to the secure host.")
         return 3
 
-    print(f"\nAll {len(kernels)} symbol file(s) present. Safe to return to the secure host.")
+    if uncovered_modules:
+        print("Modules with no copy at all: " + ", ".join(uncovered_modules) + ".")
+        print("Only the plugins needing them are affected; everything else can run.")
+    else:
+        print("The kernel and every module name are covered; the still-missing records")
+        print("are extra in-memory copies. Safe to return to the secure host.")
     return 0
 
 
