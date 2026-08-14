@@ -301,14 +301,22 @@ def cmd_triage(args: argparse.Namespace) -> int:
     started = manifest.utc_now()
 
     probe = triage.run_probe(plan, engine)
-    if not probe.ok and not args.force:
+    if not probe.ok:
         print("\nProbe failed, so the run would produce nothing useful.")
         print(triage.probe_diagnosis(probe))
-        print("\nUse --force to run the plugins anyway.")
+        # Keep the log either way: it is the only record of the cause, and on a
+        # forced run it is the only means of judging whether the output is sound.
+        kept = triage.cleanup_probe(plan, keep_log=True)
+        if kept is not None:
+            print(f"\nFull probe log: {kept}")
+        if not args.force:
+            print("\nUse --force to run the plugins anyway.")
+            return 4
+        print("\n--force given: running plugins despite the failed probe. Results may")
+        print("be incomplete or wrong; check the probe log above before relying on them.\n")
+    else:
         triage.cleanup_probe(plan)
-        return 4
-    triage.cleanup_probe(plan)
-    print("Probe ok.\n")
+        print("Probe ok.\n")
 
     tasks = triage.build_tasks(plan, engine)
     done = {"n": 0}

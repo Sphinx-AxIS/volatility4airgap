@@ -151,18 +151,52 @@ def run_probe(plan: TriagePlan, engine: VolEngine, *, log=print) -> scheduler.Ta
     return result
 
 
+#: Root causes Volatility reports as a *warning* partway through its log, while the
+#: final line states only the consequence — usually "Unable to validate the plugin
+#: requirements: ['plugins.Info.kernel.layer_name', ...]". Reading just the last line
+#: therefore reports the symptom and throws away the answer, which is precisely what a
+#: stuck analyst needs. Each entry maps a fragment of Volatility's own message to an
+#: explanation that names the fix.
+_PROBE_CAUSES: tuple[tuple[str, str], ...] = (
+    (
+        "no metadata file found alongside vmem",
+        "This VMEM has no VMSS/VMSN metadata file that Volatility could pair with it.\n"
+        "  The companion must be in the SAME folder with the SAME basename:\n"
+        "      image.vmem  ->  image.vmss   (tried first)\n"
+        "      image.vmem  ->  image.vmsn   (tried only if no .vmss)\n"
+        "  Volatility derives the name by replacing the extension, so renaming the\n"
+        "  VMEM without renaming its companion breaks the pairing. A VMSN belonging\n"
+        "  to a different snapshot will not match either.\n"
+        "  The metadata carries the guest's memory-region map. Without it the file\n"
+        "  cannot be translated above the 4 GB PCI hole, so no kernel layer is built.",
+    ),
+    (
+        "invalid vmware",
+        "The VMSS/VMSN beside this VMEM could not be parsed. It may be truncated, or\n"
+        "  may belong to a different snapshot than the VMEM.",
+    ),
+)
+
+
 def probe_diagnosis(result: scheduler.TaskResult) -> str:
     """Turn a failed probe into something actionable."""
-    detail = ""
+    if result.timed_out:
+        return "The probe timed out. The image may be very large or on slow media."
+
+    text = ""
     try:
         text = result.task.stderr_path.read_text(encoding="utf-8", errors="replace")
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        detail = lines[-1] if lines else ""
     except OSError:
         pass
 
-    if result.timed_out:
-        return "The probe timed out. The image may be very large or on slow media."
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    detail = lines[-1] if lines else ""
+
+    # A named root cause beats the generic consequence on the last line.
+    whole_log = text.lower()
+    for needle, explanation in _PROBE_CAUSES:
+        if needle in whole_log:
+            return explanation
 
     lowered = detail.lower()
 
@@ -171,9 +205,15 @@ def probe_diagnosis(result: scheduler.TaskResult) -> str:
     # identify the image — as a symbol problem, sending the analyst back across the
     # air gap for symbols they already have.
     if "unsatisfied" in lowered or "requirement" in lowered:
+        hint = ""
+        if str(result.task.command[-3:]).lower().count(".vmem") or ".vmem" in whole_log:
+            hint = (
+                "\n  This is a VMEM: check that its VMSS/VMSN companion sits in the "
+                "same\n  folder with the same basename."
+            )
         return (
             "Volatility could not identify the image. It may not be a supported "
-            f"Windows memory capture.\n  {detail}"
+            f"Windows memory capture.{hint}\n  {detail}"
         )
     if "symbol" in lowered or re.search(r"\bisf\b", lowered):
         return (
@@ -281,8 +321,29 @@ def plugin_records(outcomes: list[PluginOutcome]) -> list[dict]:
     return records
 
 
-def cleanup_probe(plan: TriagePlan) -> None:
-    shutil.rmtree(plan.output_dir / ".probe", ignore_errors=True)
+def cleanup_probe(plan: TriagePlan, *, keep_log: bool = False) -> Path | None:
+    """Remove the probe's scratch directory, optionally preserving its log.
+
+    When the probe fails, that log is the only record of *why*. Volatility states the
+    cause as a warning partway through and only the consequence at the end, so an
+    analyst who needs to read the whole thing must be able to find it — deleting it
+    along with the scratch directory leaves them with the symptom and nothing else.
+    """
+    probe_dir = plan.output_dir / ".probe"
+    kept: Path | None = None
+
+    if keep_log:
+        source = probe_dir / "probe.log"
+        if source.is_file():
+            kept = plan.output_dir / "logs" / "probe.log"
+            kept.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(source, kept)
+            except OSError:
+                kept = None
+
+    shutil.rmtree(probe_dir, ignore_errors=True)
+    return kept
 
 
 def write_manifest(

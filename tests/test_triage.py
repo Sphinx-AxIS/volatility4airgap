@@ -300,6 +300,70 @@ class TestProbeDiagnosis:
         result = self._result(tmp_path, "No ISF found for the required GUID")
         assert "could not load symbols" in triage.probe_diagnosis(result)
 
+    def test_names_the_cause_not_the_consequence(self, tmp_path) -> None:
+        """Regression: the cause is a warning partway through, not the last line.
+
+        Volatility warns that a VMEM has no matching VMSS/VMSN, then fails several
+        lines later with "Unable to validate the plugin requirements". Reporting only
+        the last line told the analyst the image was unsupported — sending them to
+        re-acquire evidence that was fine — when the fix was to rename one file.
+        """
+        result = self._result(
+            tmp_path,
+            "Volatility 3 Framework 2.28.0\n"
+            "WARNING  volatility3.framework.layers.vmware: No metadata file found "
+            "alongside VMEM file. A VMSS or VMSN file may be required to correctly "
+            "process a VMEM file. These should be placed in the same directory with "
+            "the same file name, e.g. test.vmem and test.vmss.\n"
+            "Unable to validate the plugin requirements: "
+            "['plugins.Info.kernel.layer_name', 'plugins.Info.kernel.symbol_table_name']\n",
+        )
+
+        diagnosis = triage.probe_diagnosis(result)
+
+        assert "VMSS/VMSN" in diagnosis
+        assert "same basename" in diagnosis.lower() or "SAME basename" in diagnosis
+        # The generic message must not win over the specific one.
+        assert "may not be a supported" not in diagnosis
+
+
+class TestProbeLogIsKept:
+    """The probe log is the only record of why a probe failed.
+
+    It used to be deleted with the scratch directory, leaving an analyst with a
+    one-line symptom and no way to read the warning that named the cause.
+    """
+
+    def _plan_with_probe_log(self, tmp_path, text="WARNING something diagnostic\n"):
+        plan = make_plan(tmp_path, ["a.B"])
+        plan.ensure_directories()
+        probe_dir = plan.output_dir / ".probe"
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        (probe_dir / "probe.log").write_text(text, encoding="utf-8")
+        return plan, probe_dir
+
+    def test_keeps_the_log_and_removes_the_scratch_dir(self, tmp_path) -> None:
+        plan, probe_dir = self._plan_with_probe_log(tmp_path)
+
+        kept = triage.cleanup_probe(plan, keep_log=True)
+
+        assert kept is not None and kept.is_file()
+        assert "diagnostic" in kept.read_text(encoding="utf-8")
+        assert not probe_dir.exists()
+
+    def test_discards_it_on_success(self, tmp_path) -> None:
+        plan, probe_dir = self._plan_with_probe_log(tmp_path)
+
+        assert triage.cleanup_probe(plan) is None
+        assert not probe_dir.exists()
+        assert not (plan.output_dir / "logs" / "probe.log").exists()
+
+    def test_missing_log_is_not_an_error(self, tmp_path) -> None:
+        plan = make_plan(tmp_path, ["a.B"])
+        plan.ensure_directories()
+
+        assert triage.cleanup_probe(plan, keep_log=True) is None
+
 
 class TestDirectoriesAreCreated:
     """A zip stores no empty directories, so the bundle may arrive without them.
