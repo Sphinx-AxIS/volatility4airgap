@@ -25,6 +25,13 @@ symbol_request.json
 /notes/
 /cases/
 
+# Analysis output. Covered by /output/ where triage wrote there, but --out and
+# 'analyze <dir>' can put a run anywhere, and findings name the same processes,
+# users, service binaries and network peers the plugin output does.
+findings/
+followup/
+analysis-manifest.json
+
 # Evidence — never commit memory images
 *.raw
 *.vmem
