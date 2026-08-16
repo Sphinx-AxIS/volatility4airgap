@@ -1,0 +1,30 @@
+
+[
+  {
+    "Base": 18446735277616529408,
+    "File output": "Disabled",
+    "Name": "ntoskrnl.exe",
+    "Offset": 2684354560,
+    "Path": "\\SystemRoot\\system32\\ntoskrnl.exe",
+    "Size": 1048576,
+    "__children": []
+  },
+  {
+    "Base": 18446735277616529408,
+    "File output": "Disabled",
+    "Name": "tcpip.sys",
+    "Offset": 2684358656,
+    "Path": "\\SystemRoot\\System32\\drivers\\tcpip.sys",
+    "Size": 1048576,
+    "__children": []
+  },
+  {
+    "Base": 18446735277616529408,
+    "File output": "Disabled",
+    "Name": "ndis.sys",
+    "Offset": 2684362752,
+    "Path": "\\SystemRoot\\System32\\drivers\\ndis.sys",
+    "Size": 1048576,
+    "__children": []
+  }
+]

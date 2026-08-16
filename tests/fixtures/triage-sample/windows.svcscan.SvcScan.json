@@ -1,0 +1,59 @@
+
+[
+  {
+    "Binary": "C:\\Windows\\system32\\svchost.exe -k DcomLaunch",
+    "Binary (Registry)": "C:\\Windows\\system32\\svchost.exe -k DcomLaunch",
+    "Display": "DcomLaunch",
+    "Dll": "",
+    "Name": "DcomLaunch",
+    "Offset": 3489660929,
+    "Order": 1,
+    "PID": 660,
+    "Start": "SERVICE_AUTO_START",
+    "State": "SERVICE_RUNNING",
+    "Type": "SERVICE_WIN32_OWN_PROCESS",
+    "__children": []
+  },
+  {
+    "Binary": "C:\\Windows\\system32\\svchost.exe -k netsvcs",
+    "Binary (Registry)": "C:\\Windows\\system32\\svchost.exe -k netsvcs",
+    "Display": "Dhcp",
+    "Dll": "",
+    "Name": "Dhcp",
+    "Offset": 3489660930,
+    "Order": 2,
+    "PID": 900,
+    "Start": "SERVICE_AUTO_START",
+    "State": "SERVICE_RUNNING",
+    "Type": "SERVICE_WIN32_OWN_PROCESS",
+    "__children": []
+  },
+  {
+    "Binary": "C:\\Windows\\system32\\svchost.exe -k rpc",
+    "Binary (Registry)": "C:\\Windows\\system32\\svchost.exe -k rpc",
+    "Display": "SysMonSvc",
+    "Dll": "",
+    "Name": "SysMonSvc",
+    "Offset": 3489660931,
+    "Order": 3,
+    "PID": 4180,
+    "Start": "SERVICE_AUTO_START",
+    "State": "SERVICE_RUNNING",
+    "Type": "SERVICE_WIN32_OWN_PROCESS",
+    "__children": []
+  },
+  {
+    "Binary": "C:\\Users\\jdoe\\AppData\\Local\\Temp\\upd.exe",
+    "Binary (Registry)": "C:\\Users\\jdoe\\AppData\\Local\\Temp\\upd.exe",
+    "Display": "UpdaterSvc",
+    "Dll": "",
+    "Name": "UpdaterSvc",
+    "Offset": 3489660932,
+    "Order": 4,
+    "PID": 2100,
+    "Start": "SERVICE_AUTO_START",
+    "State": "SERVICE_RUNNING",
+    "Type": "SERVICE_WIN32_OWN_PROCESS",
+    "__children": []
+  }
+]

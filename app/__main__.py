@@ -360,6 +360,28 @@ def cmd_triage(args: argparse.Namespace) -> int:
         print(f"\nPer-plugin logs: {output_dir / 'logs'}")
     print(f"\nManifest {manifest_path}")
 
+    if getattr(args, "follow_up", False):
+        # The same analyser the standalone command runs, on the folder just
+        # written. The image is already known to match, so the digest check is
+        # skipped rather than re-hashing tens of gigabytes.
+        print("\n" + "-" * 60)
+        analyze_args = argparse.Namespace(
+            output_dir=str(output_dir),
+            image=str(image),
+            rules=None,
+            validate_rules=False,
+            max_followups=10,
+            dump=False,
+            symbols=args.symbols,
+            jobs=args.jobs,
+            engine=args.engine,
+            timeout=args.timeout,
+            no_hash=True,
+        )
+        code = cmd_analyze(analyze_args)
+        if code not in (0, 1):
+            return code
+
     return 0 if not failed else 1
 
 
@@ -419,7 +441,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     json_path, csv_path = rules_mod.write(findings_dir, pack, result, findings)
 
     summary = rules_mod.summarise(findings)
-    print(f"\n{len(result.processes)} process(es) examined, "
+    print(f"\n{len(result.processes)} process(es), {len(result.modules)} module(s) "
+          f"and {len(result.services)} service(s) examined, "
           f"{sum(result.plugins_read.values())} rows across "
           f"{len(result.plugins_read)} plugin(s).")
 
@@ -431,8 +454,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         print(f"\n{summary['total']} finding(s): "
               + ", ".join(f"{summary[s]} {s}" for s in rules_mod.SEVERITIES if summary[s]))
         for finding in findings:
-            print(f"  {finding.finding_id}  {finding.severity:8s} "
-                  f"{finding.process.label:34s} {finding.title}")
+            print(f"  {finding.finding_id:10s} {finding.severity:8s} "
+                  f"{finding.entity.label:34s} {finding.title}")
 
     blocked = rules_mod.not_evaluated(pack, result)
     for rule_id, reason in sorted(blocked.items()):
@@ -514,6 +537,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
     print(f"\nFindings  {json_path}")
     print(f"          {csv_path}")
+    print(f"          {findings_dir / 'findings.txt'}")
     print(f"Next steps {steps_path}")
     print(f"Manifest  {output_dir / manifest.ANALYSIS_FILENAME}")
     return 0
@@ -895,6 +919,10 @@ def build_parser() -> argparse.ArgumentParser:
     triage_cmd.add_argument(
         "--force", action="store_true",
         help="run even if symbols are missing or the probe fails",
+    )
+    triage_cmd.add_argument(
+        "--follow-up", action="store_true",
+        help="analyse the results afterwards and collect the follow-up evidence",
     )
     triage_cmd.set_defaults(func=cmd_triage)
 

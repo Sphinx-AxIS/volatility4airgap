@@ -1,0 +1,21 @@
+
+[
+  {
+    "Driver Name": "\\Driver\\Tcpip",
+    "Name": "Tcpip",
+    "Offset": 2701131776,
+    "Service Key": "Tcpip",
+    "Size": 32768,
+    "Start": 18446735277616594944,
+    "__children": []
+  },
+  {
+    "Driver Name": "\\Driver\\evilrk",
+    "Name": "evilrk",
+    "Offset": 2701135872,
+    "Service Key": "evilrk",
+    "Size": 16384,
+    "Start": 18446735277616660480,
+    "__children": []
+  }
+]

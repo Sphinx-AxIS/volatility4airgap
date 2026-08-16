@@ -215,12 +215,19 @@ class TestShippedPack:
         return rules.load(rules.DEFAULT_PACK, known_actions=set(followup.ACTIONS))
 
     def test_it_loads(self, pack) -> None:
-        assert len(pack.rules) == 8
+        assert len(pack.rules) == 15
 
-    def test_every_signal_is_in_the_vocabulary(self, pack) -> None:
+    def test_every_signal_is_in_its_entitys_vocabulary(self, pack) -> None:
         for rule in pack.rules:
-            unknown = rule.signals() - analysis.VOCABULARY
-            assert not unknown, f"{rule.id} references {unknown}"
+            unknown = rule.signals() - analysis.VOCABULARY[rule.entity]
+            assert not unknown, f"{rule.id} ({rule.entity}) references {unknown}"
+
+    def test_every_entity_type_has_rules(self, pack) -> None:
+        covered = {rule.entity for rule in pack.rules}
+        assert covered == set(analysis.VOCABULARY)
+
+    def test_finding_id_prefixes_cover_every_entity_type(self) -> None:
+        assert set(rules._PREFIX) == set(analysis.VOCABULARY)
 
     def test_every_action_has_an_implementation(self, pack) -> None:
         """A typo here is a rule that recommends a step nothing can perform."""
@@ -248,9 +255,12 @@ class TestEvaluation:
 
         assert ranks == sorted(ranks)
 
-    def test_finding_ids_are_sequential(self, pack, sample) -> None:
+    def test_finding_ids_are_numbered_within_their_prefix(self, pack, sample) -> None:
+        """PROC-0003 is the third process finding, not the third finding."""
         findings = rules.evaluate(pack, analysis.analyse(sample))
-        assert [f.finding_id for f in findings[:2]] == ["PROC-0001", "PROC-0002"]
+        seen = [f.finding_id for f in findings if f.finding_id.startswith("PROC")]
+
+        assert seen == [f"PROC-{n:04d}" for n in range(1, len(seen) + 1)]
 
     def test_evidence_cites_the_plugin_and_the_row(self, pack, sample) -> None:
         findings = rules.evaluate(pack, analysis.analyse(sample))
@@ -294,14 +304,21 @@ class TestExpectedFindings:
     """The golden test: the whole pipeline over a fixture with known planting."""
 
     EXPECTED = [
-        ("PROC-0001", "PROC-INJECT-NET", "critical", 4180),
-        ("PROC-0002", "PROC-THREAD-INJECT", "critical", 4180),
-        ("PROC-0003", "PROC-MULTI-SIGNAL", "high", 4180),
-        ("PROC-0004", "PROC-HOLLOW", "high", 5000),
-        ("PROC-0005", "PROC-MULTI-SIGNAL", "high", 6000),
-        ("PROC-0006", "PROC-HIDDEN", "high", 7224),
-        ("PROC-0007", "PROC-XVIEW", "high", 7224),
-        ("PROC-0008", "PROC-INJECT", "medium", 2100),
+        ("KERN-0001", "KERN-SSDT-HOOK", "critical", "evilrk.sys"),
+        ("PROC-0001", "PROC-INJECT-NET", "critical", "powershell.exe (PID 4180)"),
+        ("PROC-0002", "PROC-THREAD-INJECT", "critical", "powershell.exe (PID 4180)"),
+        ("SVC-0001", "SVC-HOST-INJECTED", "critical", "SysMonSvc (PID 4180)"),
+        ("KERN-0002", "KERN-CALLBACK-UNKNOWN", "high", "<unresolved>"),
+        ("KERN-0003", "KERN-UNLINKED", "high", "evilrk.sys"),
+        ("KERN-0004", "KERN-UNBACKED-DRIVER", "high", "evilrk.sys"),
+        ("PROC-0003", "PROC-MULTI-SIGNAL", "high", "powershell.exe (PID 4180)"),
+        ("PROC-0004", "PROC-HOLLOW", "high", "svchost.exe (PID 5000)"),
+        ("PROC-0005", "PROC-MULTI-SIGNAL", "high", "lsass.exe (PID 6000)"),
+        ("PROC-0006", "PROC-HIDDEN", "high", "rundll32.exe (PID 7224)"),
+        ("PROC-0007", "PROC-XVIEW", "high", "rundll32.exe (PID 7224)"),
+        ("SVC-0002", "SVC-HIDDEN", "high", "GhostSvc"),
+        ("SVC-0003", "SVC-USER-PATH", "high", "UpdaterSvc (PID 2100)"),
+        ("PROC-0008", "PROC-INJECT", "medium", "explorer.exe (PID 2100)"),
     ]
 
     def test_matches(self, sample) -> None:
@@ -309,17 +326,45 @@ class TestExpectedFindings:
         findings = rules.evaluate(pack, analysis.analyse(sample))
 
         actual = [
-            (f.finding_id, f.rule_id, f.severity, f.process.pid) for f in findings
+            (f.finding_id, f.rule_id, f.severity, f.entity.label) for f in findings
         ]
         assert actual == self.EXPECTED
 
     def test_the_healthy_processes_produce_nothing(self, sample) -> None:
-        """Nine of the thirteen planted processes are ordinary."""
+        """Eight of the thirteen planted processes are ordinary."""
         pack = rules.load(rules.DEFAULT_PACK, known_actions=set(followup.ACTIONS))
         findings = rules.evaluate(pack, analysis.analyse(sample))
-        flagged = {f.process.pid for f in findings}
+        flagged = {
+            f.entity.pid for f in findings if f.entity.kind == analysis.PROCESS
+        }
 
         assert flagged & {4, 388, 500, 560, 660, 700, 900, 3300} == set()
+
+    def test_the_healthy_modules_produce_nothing(self, sample) -> None:
+        pack = rules.load(rules.DEFAULT_PACK, known_actions=set(followup.ACTIONS))
+        findings = rules.evaluate(pack, analysis.analyse(sample))
+        flagged = {
+            f.entity.key for f in findings if f.entity.kind == analysis.MODULE
+        }
+
+        assert flagged & {"ntoskrnl", "tcpip", "ndis", "wmixwdm"} == set()
+
+    def test_a_known_exception_driver_does_not_fire(self, sample) -> None:
+        """DriverModule marks the benign disconnects; the rule must honour it."""
+        result = analysis.analyse(sample)
+        (known,) = [m for m in result.modules if m.key == "wmixwdm"]
+
+        assert "known_exception" in known.signals
+        assert "unbacked_driver" not in known.signals
+
+    def test_bare_malfind_does_not_escalate_a_service(self, sample) -> None:
+        """explorer has malfind but nothing qualifying it, so UpdaterSvc's only
+        finding is its binary path — not a critical host-injection claim."""
+        pack = rules.load(rules.DEFAULT_PACK, known_actions=set(followup.ACTIONS))
+        findings = rules.evaluate(pack, analysis.analyse(sample))
+        updater = [f for f in findings if getattr(f.entity, "key", "") == "updatersvc"]
+
+        assert [f.rule_id for f in updater] == ["SVC-USER-PATH"]
 
 
 class TestOutput:
@@ -340,6 +385,33 @@ class TestOutput:
         assert "plugins_missing" in document
         assert "windows.netstat.NetStat" in document["plugins_missing"]
 
+    def test_a_readable_report_is_written_too(self, written) -> None:
+        """findings.csv is a table; findings.txt is the paragraph above it."""
+        (json_path, _), _ = written
+        text = (json_path.parent / "findings.txt").read_text()
+
+        assert "FINDINGS" in text
+        assert "evilrk.sys" in text
+        assert "SysMonSvc" in text
+
+    def test_the_report_names_rules_that_could_not_run(self, sample, tmp_path) -> None:
+        """Their absence from the findings above must not read as a clean result."""
+        (sample / "windows.malware.hollowprocesses.HollowProcesses.json").unlink()
+        pack = rules.load(rules.DEFAULT_PACK, known_actions=set(followup.ACTIONS))
+        result = analysis.analyse(sample)
+        text = rules.report(pack, result, rules.evaluate(pack, result))
+
+        assert "NOT EVALUATED" in text
+        assert "PROC-HOLLOW" in text
+
+    def test_the_report_does_not_repeat_a_title_as_its_own_evidence(
+        self, written
+    ) -> None:
+        (json_path, _), _ = written
+        text = (json_path.parent / "findings.txt").read_text()
+
+        assert text.count("Kernel callback owned by no identifiable module") == 1
+
     def test_json_records_the_rule_pack_digest(self, written) -> None:
         (json_path, _), pack = written
         document = json.loads(json_path.read_text())
@@ -354,4 +426,4 @@ class TestOutput:
             rows = list(csv_mod.reader(handle))
 
         assert rows[0] == list(rules.CSV_COLUMNS)
-        assert len(rows) == 9  # header plus eight findings
+        assert len(rows) == 16  # header plus fifteen findings

@@ -31,11 +31,23 @@ FILENAME = "next-steps.json"
 
 @dataclass(frozen=True)
 class Step:
-    """One Volatility invocation, scoped to a process."""
+    """One Volatility invocation, scoped to an entity.
+
+    ``scope`` names the flag used to narrow the plugin and the value the entity
+    must supply for it. A process supplies ``pid``; a kernel module supplies
+    ``name``; a service supplies the ``pid`` of the process hosting it, which is
+    what turns "this service is odd" into an examination of the thing running
+    it. A step whose scope an entity cannot supply is skipped and said so.
+    """
 
     plugin: str
+    scope: str = "pid"
     extra: tuple[str, ...] = ()
     requires_dump: bool = False
+
+    @property
+    def flag(self) -> str:
+        return f"--{self.scope}"
 
 
 #: Action name -> the steps it expands to. The rule pack is validated against
@@ -54,8 +66,18 @@ ACTIONS: dict[str, tuple[Step, ...]] = {
         Step("windows.privileges.Privs"),
         Step("windows.handles.Handles"),
     ),
-    "dump_process": (Step("windows.pslist.PsList", ("--dump",), requires_dump=True),),
-    "dump_vads": (Step("windows.vadinfo.VadInfo", ("--dump",), requires_dump=True),),
+    # Kernel. Modules and ModScan take --name as a substring match, so the
+    # normalised module key is the right argument.
+    "inspect_module": (
+        Step("windows.modules.Modules", scope="name"),
+        Step("windows.modscan.ModScan", scope="name"),
+    ),
+    "dump_process": (Step("windows.pslist.PsList", extra=("--dump",),
+                          requires_dump=True),),
+    "dump_vads": (Step("windows.vadinfo.VadInfo", extra=("--dump",),
+                       requires_dump=True),),
+    "dump_module": (Step("windows.modules.Modules", scope="name", extra=("--dump",),
+                         requires_dump=True),),
 }
 
 
@@ -108,16 +130,28 @@ class Plan:
         }
 
 
-def directory_name(finding: Finding, *, ambiguous_pids: set[int]) -> str:
-    """``PID-4180``, or ``PID-4180-0x…`` where one PID names two processes.
+#: Filesystem-safe characters for an entity directory name.
+_SAFE = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_")
 
-    PsScan can recover two processes that reused a PID. They are separate
-    entities and their evidence must not land in the same folder.
+
+def _slug(text: str) -> str:
+    cleaned = "".join(c if c in _SAFE else "-" for c in str(text)).strip("-")
+    return cleaned[:60] or "unnamed"
+
+
+def directory_name(entity, *, ambiguous: set) -> str:
+    """``PID-4180``, ``KERN-evil``, ``SVC-updatersvc``.
+
+    A PID that names two processes gets its offset appended. PsScan can recover
+    two processes that reused a PID; they are separate entities and their
+    evidence must not land in one folder.
     """
-    pid = finding.process.pid
-    if pid in ambiguous_pids and finding.process.offset is not None:
-        return f"PID-{pid}-{finding.process.offset:x}"
-    return f"PID-{pid}"
+    if entity.kind == "process":
+        if entity.pid in ambiguous and entity.offset is not None:
+            return f"PID-{entity.pid}-{entity.offset:x}"
+        return f"PID-{entity.pid}"
+    prefix = "KERN" if entity.kind == "module" else "SVC"
+    return f"{prefix}-{_slug(entity.key)}"
 
 
 def plan(
@@ -128,18 +162,21 @@ def plan(
 ) -> Plan:
     """Turn findings into an ordered, de-duplicated task list.
 
-    Findings are grouped by process, because two rules firing on one PID should
-    not collect the same evidence twice. Processes are taken most severe first,
-    so a cap truncates the tail rather than an arbitrary slice.
+    Findings are grouped by entity, because two rules firing on one process
+    should not collect the same evidence twice. Entities are taken most severe
+    first, so a cap truncates the tail rather than an arbitrary slice.
     """
     result = Plan(max_followups=max_followups)
 
-    order: list[tuple[int, int | None]] = []
-    grouped: dict[tuple[int, int | None], list[Finding]] = {}
+    order: list[tuple] = []
+    grouped: dict[tuple, list[Finding]] = {}
     for finding in sorted(
-        findings, key=lambda f: (SEVERITIES.index(f.severity), f.process.pid)
+        findings,
+        key=lambda f: (
+            SEVERITIES.index(f.severity), f.entity.kind, f.entity.sort_key
+        ),
     ):
-        key = finding.process.key
+        key = (finding.entity.kind, finding.entity.sort_key)
         if key not in grouped:
             grouped[key] = []
             order.append(key)
@@ -147,7 +184,8 @@ def plan(
 
     result.elevated = len(order)
 
-    pids = [key[0] for key in order]
+    pids = [f[0].entity.pid for f in grouped.values()
+            if f[0].entity.kind == "process"]
     ambiguous = {pid for pid in pids if pids.count(pid) > 1}
 
     selected = order[:max_followups]
@@ -158,11 +196,14 @@ def plan(
             f"{len(selected)} by severity. Raise with --max-followups {len(order)}."
         )
 
+    unscoped: set[str] = set()
+
     for key in selected:
         group = grouped[key]
-        first = group[0]
-        folder = directory_name(first, ambiguous_pids=ambiguous)
-        entity = first.process.as_entity()
+        subject = group[0].entity
+        folder = directory_name(subject, ambiguous=ambiguous)
+        entity = subject.as_entity()
+        scopes = subject.scope_values()
 
         actions: list[str] = []
         for finding in group:
@@ -177,15 +218,23 @@ def plan(
                     continue
                 seen.add((step.plugin, step.extra))
 
-                args = [*step.extra, "--pid", str(first.process.pid)]
+                value = scopes.get(step.scope)
                 task = PlannedTask(
                     entity=entity,
                     directory=f"followup/{folder}",
                     action=action,
                     plugin=step.plugin,
-                    plugin_args=args,
+                    plugin_args=[*step.extra, step.flag, str(value)],
                 )
-                if step.requires_dump and not allow_dump:
+                if value is None:
+                    # A service with no running host has no PID to scope by. Say
+                    # so rather than running the plugin unscoped over the image.
+                    task.plugin_args = []
+                    task.skipped_reason = (
+                        f"{subject.kind} supplies no {step.scope} to scope by"
+                    )
+                    unscoped.add(subject.label)
+                elif step.requires_dump and not allow_dump:
                     task.skipped_reason = "requires --dump"
                 result.tasks.append(task)
 
@@ -196,6 +245,13 @@ def plan(
             "--dump to collect them.\n"
             "  Note: dumped executables may be quarantined by endpoint "
             "protection on this host."
+        )
+    if unscoped:
+        result.notices.append(
+            f"{len(unscoped)} entity(ies) could not be followed up automatically: "
+            + ", ".join(sorted(unscoped))
+            + "\n  Nothing was run unscoped, which would have re-read the whole "
+            "image."
         )
 
     return result

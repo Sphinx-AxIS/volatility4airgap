@@ -1,0 +1,17 @@
+
+[
+  {
+    "Address": 18446735277616603136,
+    "Index": 0,
+    "Module": "ntoskrnl.exe",
+    "Symbol": "NtAcceptConnectPort",
+    "__children": []
+  },
+  {
+    "Address": 18446735277616668672,
+    "Index": 41,
+    "Module": "evilrk.sys",
+    "Symbol": "N/A",
+    "__children": []
+  }
+]

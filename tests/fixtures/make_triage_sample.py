@@ -135,6 +135,88 @@ write("windows.malware.psxview.PsXView.json", [
      "thrdscan": True, "csrss": False, "Exit Time": None},
 ])
 
+# --- Kernel surface -------------------------------------------------------
+# evilrk.sys is the planted rootkit: recovered by scan but absent from the
+# loaded list, registering a driver from that hidden module, and owning an SSDT
+# entry. Everything else here is ordinary.
+
+def module_row(name, path, base=0xFFFFF80000000000, offset=0xA0000000):
+    return {"__children": [], "Offset": offset, "Base": base, "Size": 0x100000,
+            "Name": name, "Path": path, "File output": "Disabled"}
+
+LOADED = [
+    ("ntoskrnl.exe", "\\SystemRoot\\system32\\ntoskrnl.exe"),
+    ("tcpip.sys", "\\SystemRoot\\System32\\drivers\\tcpip.sys"),
+    ("ndis.sys", "\\SystemRoot\\System32\\drivers\\ndis.sys"),
+]
+write("windows.modules.Modules.json",
+      [module_row(n, p, offset=0xA0000000 + i * 0x1000)
+       for i, (n, p) in enumerate(LOADED)])
+write("windows.modscan.ModScan.json",
+      [module_row(n, p, offset=0xA0000000 + i * 0x1000)
+       for i, (n, p) in enumerate(LOADED)]
+      + [module_row("evilrk.sys", "", offset=0xA0009000)])
+
+write("windows.driverscan.DriverScan.json", [
+    {"__children": [], "Offset": 0xA1000000, "Start": 0xFFFFF80000010000,
+     "Size": 0x8000, "Service Key": "Tcpip", "Driver Name": "\\Driver\\Tcpip",
+     "Name": "Tcpip"},
+    {"__children": [], "Offset": 0xA1001000, "Start": 0xFFFFF80000020000,
+     "Size": 0x4000, "Service Key": "evilrk", "Driver Name": "\\Driver\\evilrk",
+     "Name": "evilrk"},
+])
+
+write("windows.malware.drivermodule.DriverModule.json", [
+    {"__children": [], "Offset": 0xA1001000, "Known Exception": False,
+     "Driver Name": "\\Driver\\evilrk", "Service Key": "evilrk",
+     "Alternative Name": "evilrk"},
+    # Upstream recognises this one; the rule must not fire on it.
+    {"__children": [], "Offset": 0xA1002000, "Known Exception": True,
+     "Driver Name": "\\Driver\\WMIxWDM", "Service Key": "",
+     "Alternative Name": ""},
+])
+
+write("windows.callbacks.Callbacks.json", [
+    {"__children": [], "Type": "PsSetCreateProcessNotifyRoutine",
+     "Callback": 0xFFFFF80000011000, "Module": "ntoskrnl.exe",
+     "Symbol": "PspCreateProcessNotify", "Detail": ""},
+    {"__children": [], "Type": "PsSetCreateThreadNotifyRoutine",
+     "Callback": 0xFFFFF80000021000, "Module": "UNKNOWN", "Symbol": "",
+     "Detail": ""},
+])
+
+write("windows.ssdt.SSDT.json", [
+    {"__children": [], "Index": 0, "Address": 0xFFFFF80000012000,
+     "Module": "ntoskrnl.exe", "Symbol": "NtAcceptConnectPort"},
+    {"__children": [], "Index": 41, "Address": 0xFFFFF80000022000,
+     "Module": "evilrk.sys", "Symbol": "N/A"},
+])
+
+# --- Services -------------------------------------------------------------
+
+def service_row(order, pid, name, binary, state="SERVICE_RUNNING"):
+    return {"__children": [], "Offset": 0xD0000000 + order, "Order": order,
+            "PID": pid, "Start": "SERVICE_AUTO_START", "State": state,
+            "Type": "SERVICE_WIN32_OWN_PROCESS", "Name": name,
+            "Display": name, "Binary": binary,
+            "Binary (Registry)": binary, "Dll": ""}
+
+write("windows.svcscan.SvcScan.json", [
+    service_row(1, 660, "DcomLaunch",
+                "C:\\Windows\\system32\\svchost.exe -k DcomLaunch"),
+    service_row(2, 900, "Dhcp", "C:\\Windows\\system32\\svchost.exe -k netsvcs"),
+    # Hosted by the injected powershell process.
+    service_row(3, 4180, "SysMonSvc", "C:\\Windows\\system32\\svchost.exe -k rpc"),
+    # Persistence pattern: SYSTEM service running a binary a user can write.
+    service_row(4, 2100, "UpdaterSvc",
+                "C:\\Users\\jdoe\\AppData\\Local\\Temp\\upd.exe"),
+])
+
+# Present in the registry, absent from the service manager's own list.
+write("windows.malware.svcdiff.SvcDiff.json", [
+    service_row(9, 0, "GhostSvc", "C:\\Windows\\system32\\ghost.exe"),
+])
+
 (OUT / "run-manifest.json").write_text(json.dumps({
     "schema_version": 1,
     "tool_version": "0.1.0",

@@ -505,3 +505,66 @@ class TestAnalyzeCommand:
         main(["analyze", str(sample)])
 
         assert manifest.sha256_file(sample / manifest.FILENAME) == before
+
+    def test_it_reports_all_three_entity_types(self, sample, capsys) -> None:
+        main(["analyze", str(sample)])
+        out = capsys.readouterr().out
+
+        assert "process(es)" in out and "module(s)" in out and "service(s)" in out
+        assert "KERN-0001" in out and "SVC-0001" in out and "PROC-0001" in out
+
+    def test_it_writes_a_readable_report(self, sample) -> None:
+        main(["analyze", str(sample)])
+        text = (sample / "findings" / "findings.txt").read_text()
+
+        assert text.startswith("FINDINGS")
+
+    def test_an_unscoped_entity_is_reported_not_skipped_silently(
+        self, sample, capsys
+    ) -> None:
+        main(["analyze", str(sample)])
+        out = capsys.readouterr().out
+
+        assert "could not be followed up automatically" in out
+        assert "GhostSvc" in out
+
+    def test_a_module_signal_in_a_process_rule_is_diagnosed(
+        self, sample, tmp_path, capsys
+    ) -> None:
+        """The likeliest rule-authoring mistake, once there are three vocabularies."""
+        import json
+
+        pack = tmp_path / "bad.json"
+        pack.write_text(json.dumps({
+            "schema_version": 1,
+            "rules": [{"id": "X", "severity": "high", "title": "t",
+                       "signal": "ssdt_hook"}],
+        }))
+        code = main(["analyze", str(sample), "--rules", str(pack),
+                     "--validate-rules"])
+
+        assert code == 2
+        assert "that is a module signal" in capsys.readouterr().err
+
+
+class TestTriageFollowUp:
+    def test_the_flag_exists_and_defaults_off(self) -> None:
+        from app.__main__ import build_parser
+
+        args = build_parser().parse_args(["triage", "--image", "x"])
+        assert args.follow_up is False
+
+    def test_it_can_be_enabled(self) -> None:
+        from app.__main__ import build_parser
+
+        args = build_parser().parse_args(["triage", "--image", "x", "--follow-up"])
+        assert args.follow_up is True
+
+    def test_it_reuses_the_analyze_command(self, monkeypatch) -> None:
+        """One code path, so the two entry points cannot drift apart."""
+        import inspect
+
+        from app import __main__ as cli
+
+        source = inspect.getsource(cli.cmd_triage)
+        assert "cmd_analyze(" in source

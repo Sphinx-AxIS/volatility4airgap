@@ -3,9 +3,16 @@
 Triage writes one file per plugin. An analyst reading those files does the
 correlation in their head: this PID in malfind is that PID in netscan is that
 PID in pstree. This module does it on paper instead, producing one record per
-process that carries every row any plugin reported about it.
+entity that carries every row any plugin reported about it.
 
-Two things make that harder than it sounds.
+Three entity types, because the questions differ. A *process* is the spine of
+most investigations. A *module* covers the kernel surface — loaded drivers,
+callbacks, SSDT entries — where the equivalent of a hidden process is a module
+missing from the loaded list. A *service* sits between the two: it names a
+binary, and it names the process hosting it, which is what lets a finding run
+from "this service is odd" to "and its host process has injected code in it".
+
+Two things make correlation harder than it sounds.
 
 Column names are not stable. ``PID`` in ten plugins is ``Pid`` in LdrModules.
 The process name is ``ImageFileName`` in PsList, ``Process`` in Malfind,
@@ -34,39 +41,65 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 #: Values Volatility uses for "this column does not apply here".
-_ABSENT = {None, "", "N/A", "-", "Disabled"}
+_ABSENT = {None, "", "N/A", "-", "Disabled", "UNKNOWN", "Unknown"}
+
+PROCESS = "process"
+MODULE = "module"
+SERVICE = "service"
 
 
 @dataclass(frozen=True)
 class Extractor:
-    """How to find a process in one plugin's rows."""
+    """How to find an entity in one plugin's rows."""
 
     plugin: str
-    pid: str
+    entity: str = PROCESS
+    #: Column holding the entity's identity: a PID, a module name, a service name.
+    key: str = "PID"
+    #: Fallback identity column, used when ``key`` is absent from the row.
+    alt_key: str | None = None
     name: str | None = None
     ppid: str | None = None
-    #: Only set where the offset identifies the *process*. See the module note.
+    #: Only set where the offset identifies the *entity*. See the module note.
     offset_prefix: str | None = None
     #: PsTree emits a hierarchy; every other plugin emits a flat list.
     nested: bool = False
 
 
 EXTRACTORS: tuple[Extractor, ...] = (
-    Extractor("windows.pslist.PsList", "PID", "ImageFileName", "PPID", "Offset"),
-    Extractor("windows.psscan.PsScan", "PID", "ImageFileName", "PPID", "Offset"),
-    Extractor("windows.pstree.PsTree", "PID", "ImageFileName", "PPID", "Offset",
-              nested=True),
-    Extractor("windows.cmdline.CmdLine", "PID", "Process"),
-    Extractor("windows.netscan.NetScan", "PID", "Owner"),
-    Extractor("windows.netstat.NetStat", "PID", "Owner"),
-    Extractor("windows.malware.malfind.Malfind", "PID", "Process"),
-    Extractor("windows.malware.hollowprocesses.HollowProcesses", "PID", "Process"),
-    Extractor("windows.malware.processghosting.ProcessGhosting", "PID", "Process"),
-    Extractor("windows.malware.psxview.PsXView", "PID", "Name"),
-    Extractor("windows.malware.ldrmodules.LdrModules", "Pid", "Process"),
-    Extractor("windows.malware.suspicious_threads.SuspiciousThreads", "PID", "Process"),
-    Extractor("windows.malware.pebmasquerade.PebMasquerade", "PID",
-              "EPROCESS_ImageFileName"),
+    # Processes.
+    Extractor("windows.pslist.PsList", PROCESS, "PID",
+              name="ImageFileName", ppid="PPID", offset_prefix="Offset"),
+    Extractor("windows.psscan.PsScan", PROCESS, "PID",
+              name="ImageFileName", ppid="PPID", offset_prefix="Offset"),
+    Extractor("windows.pstree.PsTree", PROCESS, "PID",
+              name="ImageFileName", ppid="PPID", offset_prefix="Offset", nested=True),
+    Extractor("windows.cmdline.CmdLine", PROCESS, "PID", name="Process"),
+    Extractor("windows.netscan.NetScan", PROCESS, "PID", name="Owner"),
+    Extractor("windows.netstat.NetStat", PROCESS, "PID", name="Owner"),
+    Extractor("windows.malware.malfind.Malfind", PROCESS, "PID", name="Process"),
+    Extractor("windows.malware.hollowprocesses.HollowProcesses", PROCESS, "PID",
+              name="Process"),
+    Extractor("windows.malware.processghosting.ProcessGhosting", PROCESS, "PID",
+              name="Process"),
+    Extractor("windows.malware.psxview.PsXView", PROCESS, "PID", name="Name"),
+    Extractor("windows.malware.ldrmodules.LdrModules", PROCESS, "Pid", name="Process"),
+    Extractor("windows.malware.suspicious_threads.SuspiciousThreads", PROCESS, "PID",
+              name="Process"),
+    Extractor("windows.malware.pebmasquerade.PebMasquerade", PROCESS, "PID",
+              name="EPROCESS_ImageFileName"),
+    # Kernel modules and drivers.
+    Extractor("windows.modules.Modules", MODULE, "Name", name="Name"),
+    Extractor("windows.modscan.ModScan", MODULE, "Name", name="Name"),
+    Extractor("windows.driverscan.DriverScan", MODULE, "Driver Name",
+              alt_key="Name", name="Driver Name"),
+    Extractor("windows.malware.drivermodule.DriverModule", MODULE, "Driver Name",
+              alt_key="Alternative Name", name="Driver Name"),
+    Extractor("windows.callbacks.Callbacks", MODULE, "Module", name="Module"),
+    Extractor("windows.ssdt.SSDT", MODULE, "Module", name="Module"),
+    # Services.
+    Extractor("windows.svcscan.SvcScan", SERVICE, "Name", name="Name"),
+    Extractor("windows.malware.svcdiff.SvcDiff", SERVICE, "Name", name="Name"),
 )
 
 BY_PLUGIN = {e.plugin: e for e in EXTRACTORS}
@@ -83,8 +116,39 @@ class Notice:
         return self.message
 
 
+class Entity:
+    """Shared behaviour. Not a dataclass, so subclasses may declare required fields.
+
+    Python 3.9 has no ``kw_only``, so a dataclass base with defaulted fields
+    would forbid a subclass field without one — and ``Process.pid`` must not
+    have a default.
+    """
+
+    kind: str = ""
+    seen_in: dict
+    signals: set
+
+    def rows(self, plugin: str) -> list[dict]:
+        return self.seen_in.get(plugin, [])
+
+    @property
+    def label(self) -> str:
+        raise NotImplementedError
+
+    @property
+    def sort_key(self) -> tuple:
+        raise NotImplementedError
+
+    def scope_values(self) -> dict[str, str]:
+        """How a follow-up plugin can be pointed at this entity."""
+        return {}
+
+    def as_entity(self) -> dict:
+        raise NotImplementedError
+
+
 @dataclass
-class Process:
+class Process(Entity):
     pid: int
     offset: int | None = None
     #: The column the offset came from, e.g. ``Offset(V)``. Two offsets are only
@@ -92,9 +156,10 @@ class Process:
     offset_kind: str | None = None
     name: str | None = None
     ppid: int | None = None
-    #: plugin name -> the raw rows that plugin reported for this process.
     seen_in: dict[str, list[dict]] = field(default_factory=dict)
     signals: set[str] = field(default_factory=set)
+
+    kind = PROCESS
 
     @property
     def key(self) -> tuple[int, int | None]:
@@ -104,12 +169,16 @@ class Process:
     def label(self) -> str:
         return f"{self.name or 'unknown'} (PID {self.pid})"
 
-    def rows(self, plugin: str) -> list[dict]:
-        return self.seen_in.get(plugin, [])
+    @property
+    def sort_key(self) -> tuple:
+        return (self.pid, self.offset or 0)
+
+    def scope_values(self) -> dict[str, str]:
+        return {"pid": str(self.pid)}
 
     def as_entity(self) -> dict:
         return {
-            "type": "process",
+            "type": PROCESS,
             "pid": self.pid,
             "offset": self.offset,
             "name": self.name,
@@ -118,8 +187,77 @@ class Process:
 
 
 @dataclass
+class Module(Entity):
+    """A kernel module or driver, keyed by normalised name.
+
+    ``\\Driver\\foo`` from DriverScan and ``foo.sys`` from Modules are the same
+    thing under most rootkit techniques, so both normalise to ``foo``. Where a
+    driver's name genuinely differs from its module's, they stay separate —
+    which is right: merging them would invent a relationship.
+    """
+
+    key: str
+    name: str | None = None
+    seen_in: dict[str, list[dict]] = field(default_factory=dict)
+    signals: set[str] = field(default_factory=set)
+
+    kind = MODULE
+
+    @property
+    def label(self) -> str:
+        return self.name or self.key
+
+    @property
+    def sort_key(self) -> tuple:
+        return (self.key,)
+
+    def scope_values(self) -> dict[str, str]:
+        # Volatility's --name is a substring match, so the normalised key is a
+        # better argument than the decorated name it came from.
+        return {"name": self.key}
+
+    def as_entity(self) -> dict:
+        return {"type": MODULE, "key": self.key, "name": self.name}
+
+
+@dataclass
+class Service(Entity):
+    key: str
+    name: str | None = None
+    pid: int | None = None
+    binary: str | None = None
+    seen_in: dict[str, list[dict]] = field(default_factory=dict)
+    signals: set[str] = field(default_factory=set)
+
+    kind = SERVICE
+
+    @property
+    def label(self) -> str:
+        host = f" (PID {self.pid})" if self.pid else ""
+        return f"{self.name or self.key}{host}"
+
+    @property
+    def sort_key(self) -> tuple:
+        return (self.key,)
+
+    def scope_values(self) -> dict[str, str]:
+        return {"pid": str(self.pid)} if self.pid else {}
+
+    def as_entity(self) -> dict:
+        return {
+            "type": SERVICE,
+            "key": self.key,
+            "name": self.name,
+            "pid": self.pid,
+            "binary": self.binary,
+        }
+
+
+@dataclass
 class Analysis:
     processes: list[Process] = field(default_factory=list)
+    modules: list[Module] = field(default_factory=list)
+    services: list[Service] = field(default_factory=list)
     #: Plugins whose JSON was read, mapped to their row count.
     plugins_read: dict[str, int] = field(default_factory=dict)
     #: Plugins the run should have had but does not, mapped to why.
@@ -131,6 +269,15 @@ class Analysis:
 
     def by_pid(self, pid: int) -> list[Process]:
         return [p for p in self.processes if p.pid == pid]
+
+    def entities(self, kind: str) -> list:
+        return {
+            PROCESS: self.processes, MODULE: self.modules, SERVICE: self.services
+        }[kind]
+
+    @property
+    def all_entities(self) -> list:
+        return [*self.processes, *self.modules, *self.services]
 
 
 # --------------------------------------------------------------------------
@@ -202,12 +349,34 @@ def _present(value) -> bool:
     return value not in _ABSENT and value is not None
 
 
+def normalise_module(name) -> str | None:
+    """``\\Driver\\foo``, ``foo.sys`` and ``FOO.SYS`` are one module.
+
+    Rootkits register drivers from hidden modules, so the driver object and the
+    module usually share a stem even when the decorations differ. Normalising
+    to that stem is what lets DriverModule's verdict land on the same entity
+    that ModScan recovered.
+    """
+    if not _present(name):
+        return None
+    text = str(name).strip().replace("/", "\\")
+    if "\\" in text:
+        text = text.rsplit("\\", 1)[-1]
+    for suffix in (".sys", ".exe", ".dll"):
+        if text.lower().endswith(suffix):
+            text = text[: -len(suffix)]
+            break
+    return text.lower() or None
+
+
 # --------------------------------------------------------------------------
 # Entity construction
 # --------------------------------------------------------------------------
 
 
-def build_entities(rows_by_plugin: dict[str, list[dict]], analysis: Analysis) -> None:
+def _build_processes(
+    rows_by_plugin: dict[str, list[dict]], analysis: Analysis
+) -> list[Process]:
     """Fold every plugin's rows into one record per process.
 
     Keyed by PID *and* offset. PsScan can recover two distinct processes that
@@ -245,78 +414,160 @@ def build_entities(rows_by_plugin: dict[str, list[dict]], analysis: Analysis) ->
             if existing:
                 return existing[0]
 
-        process = entities.setdefault(
+        return entities.setdefault(
             (pid, offset), Process(pid=pid, offset=offset, offset_kind=kind)
         )
-        return process
 
     # Offset-bearing plugins run first, so later offset-less rows attach to a
     # fully identified entity rather than creating a shadow of it.
-    ordered = sorted(
-        rows_by_plugin, key=lambda name: BY_PLUGIN[name].offset_prefix is None
-    )
-
-    for plugin in ordered:
+    plugins = [p for p in rows_by_plugin if BY_PLUGIN[p].entity == PROCESS]
+    for plugin in sorted(plugins, key=lambda n: BY_PLUGIN[n].offset_prefix is None):
         extractor = BY_PLUGIN[plugin]
         recognised = 0
         for row in rows_by_plugin[plugin]:
-            pid = _as_int(row.get(extractor.pid))
+            pid = _as_int(row.get(extractor.key))
             if pid is None:
                 continue
             recognised += 1
 
-            offset, kind = None, None
+            offset, offset_kind = None, None
             if extractor.offset_prefix:
-                kind = _first_column(row, extractor.offset_prefix)
-                offset = _as_int(row.get(kind)) if kind else None
+                offset_kind = _first_column(row, extractor.offset_prefix)
+                offset = _as_int(row.get(offset_kind)) if offset_kind else None
 
-            process = attach(pid, offset, kind)
+            process = attach(pid, offset, offset_kind)
             process.seen_in.setdefault(plugin, []).append(row)
 
             if process.name is None and extractor.name:
-                name = row.get(extractor.name)
-                process.name = str(name) if _present(name) else None
+                value = row.get(extractor.name)
+                process.name = str(value) if _present(value) else None
             if process.ppid is None and extractor.ppid:
                 process.ppid = _as_int(row.get(extractor.ppid))
 
-        if rows_by_plugin[plugin] and recognised == 0:
-            analysis.note(
-                "warning",
-                f"{plugin} has no recognised {extractor.pid} column "
-                f"(volatility version drift?). Its "
-                f"{len(rows_by_plugin[plugin])} row(s) were skipped.",
-            )
+        _report_drift(plugin, extractor, rows_by_plugin[plugin], recognised, analysis)
 
-    analysis.processes = sorted(entities.values(), key=lambda p: (p.pid, p.offset or 0))
+    return sorted(entities.values(), key=lambda p: p.sort_key)
+
+
+def _build_modules(
+    rows_by_plugin: dict[str, list[dict]], analysis: Analysis
+) -> list[Module]:
+    entities: dict[str, Module] = {}
+
+    for plugin in (p for p in rows_by_plugin if BY_PLUGIN[p].entity == MODULE):
+        extractor = BY_PLUGIN[plugin]
+        recognised = 0
+        for row in rows_by_plugin[plugin]:
+            raw = row.get(extractor.key)
+            if not _present(raw) and extractor.alt_key:
+                raw = row.get(extractor.alt_key)
+
+            # A callback or SSDT entry whose owning module cannot be resolved is
+            # exactly the interesting case, so it becomes an entity of its own
+            # rather than being discarded for having no name.
+            key = normalise_module(raw)
+            if key is None:
+                if plugin not in ("windows.callbacks.Callbacks", "windows.ssdt.SSDT"):
+                    continue
+                key = "<unresolved>"
+            recognised += 1
+
+            module = entities.setdefault(key, Module(key=key))
+            module.seen_in.setdefault(plugin, []).append(row)
+            if module.name is None and _present(raw):
+                module.name = str(raw)
+
+        _report_drift(plugin, extractor, rows_by_plugin[plugin], recognised, analysis)
+
+    return sorted(entities.values(), key=lambda m: m.sort_key)
+
+
+def _build_services(
+    rows_by_plugin: dict[str, list[dict]], analysis: Analysis
+) -> list[Service]:
+    entities: dict[str, Service] = {}
+
+    for plugin in (p for p in rows_by_plugin if BY_PLUGIN[p].entity == SERVICE):
+        extractor = BY_PLUGIN[plugin]
+        recognised = 0
+        for row in rows_by_plugin[plugin]:
+            raw = row.get(extractor.key)
+            if not _present(raw):
+                continue
+            recognised += 1
+
+            key = str(raw).strip().lower()
+            service = entities.setdefault(key, Service(key=key))
+            service.seen_in.setdefault(plugin, []).append(row)
+
+            if service.name is None:
+                service.name = str(raw)
+            if service.pid is None:
+                service.pid = _as_int(row.get("PID")) or None
+            if service.binary is None:
+                for column in ("Binary", "Binary (Registry)"):
+                    if _present(row.get(column)):
+                        service.binary = str(row[column])
+                        break
+
+        _report_drift(plugin, extractor, rows_by_plugin[plugin], recognised, analysis)
+
+    return sorted(entities.values(), key=lambda s: s.sort_key)
+
+
+def _report_drift(
+    plugin: str, extractor: Extractor, rows: list[dict], recognised: int,
+    analysis: Analysis,
+) -> None:
+    if rows and recognised == 0:
+        analysis.note(
+            "warning",
+            f"{plugin} has no recognised {extractor.key} column "
+            f"(volatility version drift?). Its {len(rows)} row(s) were skipped.",
+        )
+
+
+def build_entities(rows_by_plugin: dict[str, list[dict]], analysis: Analysis) -> None:
+    analysis.processes = _build_processes(rows_by_plugin, analysis)
+    analysis.modules = _build_modules(rows_by_plugin, analysis)
+    analysis.services = _build_services(rows_by_plugin, analysis)
 
 
 # --------------------------------------------------------------------------
 # Signals
 # --------------------------------------------------------------------------
 
-#: The closed vocabulary. A rule may reference nothing outside this set.
-VOCABULARY: frozenset[str] = frozenset(
-    {
-        "pslist",
-        "psscan",
-        "psscan_only",
-        "exited",
-        "malfind",
-        "hollow",
-        "ghosted",
-        "peb_masquerade",
-        "psxview_hidden",
-        "suspicious_thread",
-        "ldrmodules_unlinked",
-        "network",
-        "network_external",
-        "unusual_parent",
-    }
-)
+#: The closed vocabulary, per entity type. A rule may reference nothing outside
+#: the set belonging to the entity it applies to.
+VOCABULARY: dict[str, frozenset[str]] = {
+    PROCESS: frozenset(
+        {
+            "pslist", "psscan", "psscan_only", "exited", "malfind", "hollow",
+            "ghosted", "peb_masquerade", "psxview_hidden", "suspicious_thread",
+            "ldrmodules_unlinked", "network", "network_external", "unusual_parent",
+        }
+    ),
+    MODULE: frozenset(
+        {
+            "loaded", "scanned", "scanned_only", "unbacked_driver",
+            "known_exception", "owns_callback", "unresolved_callback",
+            "ssdt_hook", "no_disk_path",
+        }
+    ),
+    SERVICE: frozenset(
+        {
+            "service_running", "svcdiff_only", "service_binary_in_user_path",
+            "service_no_binary", "service_host_injected", "service_host_hidden",
+        }
+    ),
+}
+
+ALL_SIGNALS: frozenset[str] = frozenset().union(*VOCABULARY.values())
 
 #: Which plugin each signal needs. Used to report rules that could not be
 #: evaluated rather than letting an absent plugin read as an absent finding.
 SIGNAL_SOURCE: dict[str, str] = {
+    # Process.
     "pslist": "windows.pslist.PsList",
     "psscan": "windows.psscan.PsScan",
     "psscan_only": "windows.psscan.PsScan",
@@ -331,6 +582,23 @@ SIGNAL_SOURCE: dict[str, str] = {
     "network": "windows.netscan.NetScan",
     "network_external": "windows.netscan.NetScan",
     "unusual_parent": "windows.pslist.PsList",
+    # Module.
+    "loaded": "windows.modules.Modules",
+    "scanned": "windows.modscan.ModScan",
+    "scanned_only": "windows.modscan.ModScan",
+    "unbacked_driver": "windows.malware.drivermodule.DriverModule",
+    "known_exception": "windows.malware.drivermodule.DriverModule",
+    "owns_callback": "windows.callbacks.Callbacks",
+    "unresolved_callback": "windows.callbacks.Callbacks",
+    "ssdt_hook": "windows.ssdt.SSDT",
+    "no_disk_path": "windows.modules.Modules",
+    # Service.
+    "service_running": "windows.svcscan.SvcScan",
+    "svcdiff_only": "windows.malware.svcdiff.SvcDiff",
+    "service_binary_in_user_path": "windows.svcscan.SvcScan",
+    "service_no_binary": "windows.svcscan.SvcScan",
+    "service_host_injected": "windows.malware.malfind.Malfind",
+    "service_host_hidden": "windows.malware.psxview.PsXView",
 }
 
 #: Processes whose parent is fixed by Windows itself. Deliberately short: a
@@ -347,6 +615,18 @@ EXPECTED_PARENT: dict[str, frozenset[str]] = {
     "lsaiso.exe": frozenset({"wininit.exe"}),
     "svchost.exe": frozenset({"services.exe"}),
 }
+
+#: The only modules that legitimately own a system-call table entry.
+KERNEL_MODULES = frozenset(
+    {"ntoskrnl", "ntkrnlmp", "ntkrnlpa", "ntkrpamp",
+     "win32k", "win32kbase", "win32kfull"}
+)
+
+#: Directories a Windows service binary has no ordinary reason to live in.
+#: ProgramData is deliberately excluded — several legitimate updaters use it,
+#: and the false positives would outnumber the finds.
+USER_WRITABLE = ("\\users\\", "\\temp\\", "\\appdata\\", "\\tmp\\",
+                 "\\downloads\\", "\\public\\")
 
 _NETWORK_PLUGINS = ("windows.netscan.NetScan", "windows.netstat.NetStat")
 
@@ -389,7 +669,7 @@ def _connections(process: Process) -> list[dict]:
     return rows
 
 
-def compute_signals(process: Process, analysis: Analysis) -> None:
+def compute_process_signals(process: Process, analysis: Analysis) -> None:
     """Derive the signal set for one process. Pure: reads rows, sets names."""
     signals = process.signals
 
@@ -460,6 +740,86 @@ def compute_signals(process: Process, analysis: Analysis) -> None:
             signals.add("unusual_parent")
 
 
+def compute_module_signals(module: Module, analysis: Analysis) -> None:
+    """Derive the signal set for one kernel module or driver."""
+    signals = module.signals
+
+    loaded = bool(module.rows("windows.modules.Modules"))
+    scanned = bool(module.rows("windows.modscan.ModScan"))
+    if loaded:
+        signals.add("loaded")
+    if scanned:
+        signals.add("scanned")
+
+    # The kernel analogue of psscan_only: recovered by pool scan, missing from
+    # PsLoadedModuleList. Unlike processes there is no exit time to guard
+    # against, because an unloaded driver's module entry is removed outright.
+    if scanned and not loaded:
+        signals.add("scanned_only")
+
+    # DriverModule only emits rows for drivers whose start address matches no
+    # known module, so a row is already the anomaly. Known Exception marks the
+    # ones upstream has confirmed benign.
+    for row in module.rows("windows.malware.drivermodule.DriverModule"):
+        if row.get("Known Exception") is True:
+            signals.add("known_exception")
+        else:
+            signals.add("unbacked_driver")
+
+    if module.rows("windows.callbacks.Callbacks"):
+        signals.add("owns_callback")
+        if module.key == "<unresolved>":
+            signals.add("unresolved_callback")
+
+    for row in module.rows("windows.ssdt.SSDT"):
+        owner = normalise_module(row.get("Module"))
+        if owner is None or owner not in KERNEL_MODULES:
+            signals.add("ssdt_hook")
+
+    for row in module.rows("windows.modules.Modules"):
+        if not _present(row.get("Path")):
+            signals.add("no_disk_path")
+
+
+def compute_service_signals(service: Service, analysis: Analysis) -> None:
+    """Derive the signal set for one service, including its host process."""
+    signals = service.signals
+
+    for row in service.rows("windows.svcscan.SvcScan"):
+        if str(row.get("State", "")).upper() == "SERVICE_RUNNING":
+            signals.add("service_running")
+
+    # SvcDiff walks the registry rather than the in-memory service record, so a
+    # service it finds that SvcScan does not is one hidden from the service
+    # control manager's own list.
+    if service.rows("windows.malware.svcdiff.SvcDiff") and not service.rows(
+        "windows.svcscan.SvcScan"
+    ):
+        signals.add("svcdiff_only")
+
+    if service.rows("windows.svcscan.SvcScan") and not _present(service.binary):
+        signals.add("service_no_binary")
+
+    binary = (service.binary or "").replace("/", "\\").lower()
+    if binary and any(fragment in binary for fragment in USER_WRITABLE):
+        signals.add("service_binary_in_user_path")
+
+    # The correlation the whole service entity exists for: a service is only as
+    # trustworthy as the process hosting it.
+    #
+    # Bare malfind is deliberately not enough. Every JIT compiler on the host
+    # produces an executable private VAD, which is why the process rule for it
+    # alone is only medium. Propagating that to a critical service finding would
+    # undo the distinction — so the host must carry a qualifying signal too.
+    if service.pid:
+        for host in analysis.by_pid(service.pid):
+            qualified = {"network_external", "suspicious_thread", "hollow", "ghosted"}
+            if "malfind" in host.signals and qualified & host.signals:
+                signals.add("service_host_injected")
+            if {"psscan_only", "psxview_hidden"} & host.signals:
+                signals.add("service_host_hidden")
+
+
 # --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
@@ -503,8 +863,14 @@ def analyse(output_dir: Path) -> Analysis:
         return analysis
 
     build_entities(rows_by_plugin, analysis)
+
+    # Processes first: service signals consult their host process's verdict.
     for process in analysis.processes:
-        compute_signals(process, analysis)
+        compute_process_signals(process, analysis)
+    for module in analysis.modules:
+        compute_module_signals(module, analysis)
+    for service in analysis.services:
+        compute_service_signals(service, analysis)
 
     if analysis.plugins_read and not any(analysis.plugins_read.values()):
         analysis.note(

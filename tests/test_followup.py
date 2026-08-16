@@ -23,7 +23,7 @@ def finding(pid: int, *, severity: str = "high", actions=("inspect_vads",),
         rule_id=rule_id,
         severity=severity,
         title="A finding",
-        process=process,
+        entity=process,
         actions=tuple(actions),
     )
 
@@ -239,3 +239,85 @@ class TestNextSteps:
         assert document["tasks"][0]["output"] == (
             "followup/PID-4180/windows.vadinfo.VadInfo.json"
         )
+
+
+def module_finding(key: str, *, severity: str = "high",
+                   actions=("inspect_module",)) -> rules.Finding:
+    entity = analysis.Module(key=key, name=f"{key}.sys")
+    return rules.Finding(
+        finding_id="KERN-0001", rule_id="K-1", severity=severity,
+        title="A kernel finding", entity=entity, actions=tuple(actions),
+    )
+
+
+def service_finding(key: str, *, pid: int | None = 900,
+                    actions=("inspect_context",)) -> rules.Finding:
+    entity = analysis.Service(key=key, name=key, pid=pid)
+    return rules.Finding(
+        finding_id="SVC-0001", rule_id="S-1", severity="high",
+        title="A service finding", entity=entity, actions=tuple(actions),
+    )
+
+
+class TestEntityScopes:
+    """A module is selected by --name; a service by the PID hosting it."""
+
+    def test_a_module_is_scoped_by_name(self) -> None:
+        plan = followup.plan([module_finding("evilrk")])
+
+        assert plan.tasks[0].plugin_args == ["--name", "evilrk"]
+        assert plan.tasks[0].directory == "followup/KERN-evilrk"
+
+    def test_the_normalised_key_is_used_not_the_decorated_name(self) -> None:
+        """--name is a substring match, so the stem matches both forms."""
+        entity = analysis.Module(key="evilrk", name="\\Driver\\evilrk")
+        assert entity.scope_values() == {"name": "evilrk"}
+
+    def test_a_service_is_scoped_by_its_host_pid(self) -> None:
+        """The correlation the service entity exists for."""
+        plan = followup.plan([service_finding("dhcp", pid=900)])
+
+        assert all(t.plugin_args[-2:] == ["--pid", "900"] for t in plan.tasks)
+        assert plan.tasks[0].directory == "followup/SVC-dhcp"
+
+    def test_a_service_with_no_host_is_skipped_not_run_unscoped(self) -> None:
+        """Running these plugins unscoped would re-read the whole image."""
+        plan = followup.plan([service_finding("ghostsvc", pid=None)])
+
+        assert plan.pending == []
+        assert all("no pid to scope by" in t.skipped_reason for t in plan.tasks)
+        assert any("could not be followed up" in n for n in plan.notices)
+
+    def test_directory_names_are_filesystem_safe(self) -> None:
+        plan = followup.plan([module_finding("<unresolved>")])
+        assert plan.tasks[0].directory == "followup/KERN-unresolved"
+
+    def test_entities_of_different_kinds_do_not_collide(self) -> None:
+        plan = followup.plan([
+            finding(900), module_finding("evilrk"), service_finding("dhcp", pid=900),
+        ])
+
+        assert len({t.directory for t in plan.tasks}) == 3
+        assert plan.elevated == 3
+
+    def test_module_steps_use_plugins_that_accept_name(self) -> None:
+        by_name = {
+            step.plugin
+            for steps in followup.ACTIONS.values()
+            for step in steps
+            if step.scope == "name"
+        }
+        assert by_name == {"windows.modules.Modules", "windows.modscan.ModScan"}
+
+
+class TestScopedTaskConstruction:
+    def test_name_follows_the_plugin(self, lib, tmp_path) -> None:
+        plan = followup.plan([module_finding("evilrk")])
+        tasks = followup.build_tasks(
+            plan, image=tmp_path / "m.raw", output_dir=tmp_path / "out",
+            engine=lib, symbols_dir=tmp_path / "s", cache_dir=tmp_path / "c",
+        )
+
+        assert tasks[0].command[-3:] == [
+            "windows.modules.Modules", "--name", "evilrk"
+        ]

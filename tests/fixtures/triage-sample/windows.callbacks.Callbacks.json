@@ -1,0 +1,19 @@
+
+[
+  {
+    "Callback": 18446735277616599040,
+    "Detail": "",
+    "Module": "ntoskrnl.exe",
+    "Symbol": "PspCreateProcessNotify",
+    "Type": "PsSetCreateProcessNotifyRoutine",
+    "__children": []
+  },
+  {
+    "Callback": 18446735277616664576,
+    "Detail": "",
+    "Module": "UNKNOWN",
+    "Symbol": "",
+    "Type": "PsSetCreateThreadNotifyRoutine",
+    "__children": []
+  }
+]

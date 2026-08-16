@@ -1,7 +1,7 @@
 # Post-Triage Analysis — Design
 
 **Date:** 2026-08-15
-**Status:** Approved, not yet implemented
+**Status:** Implemented
 
 ## Purpose
 
@@ -36,7 +36,7 @@ archived folders without re-running a 32 GB image.
 | Rules | External JSON rule packs, validated against a closed signal vocabulary |
 | Rule language | Fixed combinators (`all`/`any`/`none`/`at_least`). No expression DSL |
 | Dumping | Planned but not executed in v1; gated behind `--dump` |
-| Entity types | Process only. Drivers, services and files are later work |
+| Entity types | Process, kernel module, service. Files remain out of scope |
 | Manifest | Separate `analysis-manifest.json` referencing the triage manifest by digest |
 | Dependencies | Standard library only, as with the rest of `app/` |
 
@@ -345,11 +345,50 @@ host data enters the repository and the expected findings are knowable by constr
 One golden test runs `analyze` over it and diffs `findings.json` against a checked-in
 expected file.
 
-## Later work
+## Second pass
 
-Out of scope for v1, listed so the entity model does not foreclose them:
+Three of the four items originally deferred are now built. What changed:
 
-- Driver, service and file entities, and the kernel-anomaly rules in the original sketch
-- `triage --follow-up`, calling the same analyser directly
-- Executed dumping, once the quarantine and size questions have answers
-- A findings report for the analyst, as opposed to the machine-readable JSON
+**Three entity types, not one.** A `Module` covers the kernel surface and a `Service`
+sits between module and process. Rules carry an optional `entity` field defaulting to
+`process`, so a pack written against the first version still loads. The signal
+vocabulary became a dict keyed by entity type, and a rule naming a signal belonging to
+another type is told so by name rather than offered a spelling correction.
+
+Module identity is normalised: `\Driver\foo` and `foo.sys` both become `foo`. Rootkits
+register drivers from hidden modules, so the driver object and the module usually share
+a stem. Where they genuinely differ the entities stay separate, which is right —
+merging them would invent a relationship.
+
+Finding identifiers are prefixed and numbered within their prefix: `PROC-0003` is the
+third process finding, not the third finding that happens to be about a process.
+
+**Seven more rules**, taking the pack to fifteen: SSDT hooks (critical), kernel modules
+recovered by scan but absent from the loaded list, unbacked driver objects, callbacks
+owned by no identifiable module, and three service rules — hidden from the service
+manager, binary in a user-writable directory, and hosted by a process with injected code.
+
+That last one needed a guard of the same kind `psscan_only` needed. A bare malfind is
+why `PROC-INJECT` is only medium; propagating it to a critical service finding would
+have undone the distinction. `service_host_injected` therefore requires the host to
+carry a qualifying signal too — external network, suspicious thread, hollowing or
+ghosting.
+
+**Follow-up steps gained a scope.** A process is selected by `--pid`, a module by
+`--name`, a service by the PID hosting it. An entity that cannot supply its step's scope
+is skipped and said so, rather than running the plugin unscoped across the whole image.
+
+**`triage --follow-up`** calls `cmd_analyze` directly, with the digest check skipped —
+the image is already known to match, and re-hashing tens of gigabytes to prove it would
+be absurd. A test asserts the two entry points share the one code path.
+
+**`findings.txt`** joins the JSON and CSV: the same findings grouped by entity and
+written to be read, with a section naming the rules that could not run.
+
+## Still out of scope
+
+- **File entities.** FileScan and MutantScan produce entities readily enough, but no
+  rule over them clears the confidence bar the rest of the pack is held to. A path
+  looking suspicious is not a finding. Left until there is something defensible to say.
+- **Executed dumping by default.** The mechanism is built and `--dump` drives it; no
+  shipped rule recommends a dump action, and a test fails if one starts to.

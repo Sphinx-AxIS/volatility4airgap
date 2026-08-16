@@ -25,11 +25,19 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .analysis import SIGNAL_SOURCE, VOCABULARY, Analysis, Process
+from .analysis import (
+    ALL_SIGNALS,
+    PROCESS,
+    SIGNAL_SOURCE,
+    VOCABULARY,
+    Analysis,
+    Entity,
+)
 
 SCHEMA_VERSION = 1
 SEVERITIES = ("critical", "high", "medium")
 COMBINATORS = ("all", "any", "none", "at_least", "signal")
+ENTITY_TYPES = tuple(VOCABULARY)
 
 DEFAULT_PACK = Path(__file__).parent / "rules" / "default.json"
 
@@ -46,6 +54,9 @@ class Rule:
     condition: dict
     actions: tuple[str, ...]
     note: str | None = None
+    #: Which entity type the rule reads. Absent means process, so packs written
+    #: before modules and services existed keep working unchanged.
+    entity: str = PROCESS
 
     def signals(self) -> set[str]:
         return _referenced_signals(self.condition)
@@ -66,7 +77,7 @@ class Finding:
     rule_id: str
     severity: str
     title: str
-    process: Process
+    entity: Entity
     evidence: list[dict] = field(default_factory=list)
     actions: tuple[str, ...] = ()
 
@@ -77,7 +88,7 @@ class Finding:
             "rules_sha256": rules_sha256,
             "severity": self.severity,
             "title": self.title,
-            "entity": self.process.as_entity(),
+            "entity": self.entity.as_entity(),
             "evidence": self.evidence,
             "recommended_actions": list(self.actions),
         }
@@ -102,10 +113,15 @@ def _referenced_signals(node) -> set[str]:
     return found
 
 
-def _nearest(name: str) -> str:
-    """Cheapest useful suggestion: the known signal sharing the most prefix."""
+def _nearest(name: str, vocabulary) -> str:
+    """Cheapest useful suggestion: the known signal sharing the most prefix.
+
+    Searched across every entity type, not just the rule's own, so naming a
+    module signal in a process rule is told what it actually is rather than
+    offered the nearest unrelated word.
+    """
     best = max(
-        VOCABULARY,
+        vocabulary or ALL_SIGNALS,
         key=lambda known: len(_common_prefix(name, known)),
         default="",
     )
@@ -121,7 +137,9 @@ def _common_prefix(a: str, b: str) -> str:
     return "".join(out)
 
 
-def _validate_condition(node, where: str, problems: list[str]) -> None:
+def _validate_condition(
+    node, where: str, problems: list[str], vocabulary: frozenset
+) -> None:
     if not isinstance(node, dict):
         problems.append(f"{where}: condition must be an object, got {type(node).__name__}")
         return
@@ -137,12 +155,20 @@ def _validate_condition(node, where: str, problems: list[str]) -> None:
     key = used[0]
     if key == "signal":
         name = node["signal"]
-        if name not in VOCABULARY:
-            hint = _nearest(str(name))
-            suggestion = f' — did you mean "{hint}"?' if hint else ""
+        if name not in vocabulary:
+            # Naming a real signal belonging to another entity type is the most
+            # likely mistake, so say so rather than offering a spelling.
+            elsewhere = [
+                kind for kind, known in VOCABULARY.items() if name in known
+            ]
+            if elsewhere:
+                suggestion = f' — that is a {elsewhere[0]} signal'
+            else:
+                hint = _nearest(str(name), vocabulary)
+                suggestion = f' — did you mean "{hint}"?' if hint else ""
             problems.append(
                 f"{where}: unknown signal \"{name}\"{suggestion}\n"
-                f"    known signals: {', '.join(sorted(VOCABULARY))}"
+                f"    known signals: {', '.join(sorted(vocabulary))}"
             )
         return
 
@@ -160,7 +186,9 @@ def _validate_condition(node, where: str, problems: list[str]) -> None:
                 f"{len(children)} condition(s) in 'of' — it can never match"
             )
         for index, child in enumerate(children):
-            _validate_condition(child, f"{where}.at_least.of[{index}]", problems)
+            _validate_condition(
+                child, f"{where}.at_least.of[{index}]", problems, vocabulary
+            )
         return
 
     children = node[key]
@@ -168,7 +196,7 @@ def _validate_condition(node, where: str, problems: list[str]) -> None:
         problems.append(f"{where}: '{key}' must be a non-empty list")
         return
     for index, child in enumerate(children):
-        _validate_condition(child, f"{where}.{key}[{index}]", problems)
+        _validate_condition(child, f"{where}.{key}[{index}]", problems, vocabulary)
 
 
 def validate(document: dict, *, known_actions: set[str] | None = None) -> list[str]:
@@ -210,8 +238,16 @@ def validate(document: dict, *, known_actions: set[str] | None = None) -> list[s
         if not raw.get("title"):
             problems.append(f"{where}: missing 'title'")
 
+        entity = raw.get("entity", PROCESS)
+        if entity not in VOCABULARY:
+            problems.append(
+                f"{where}: unknown entity {entity!r}, "
+                f"expected one of {', '.join(ENTITY_TYPES)}"
+            )
+            continue
+
         condition = {k: v for k, v in raw.items() if k in COMBINATORS}
-        _validate_condition(condition, where, problems)
+        _validate_condition(condition, where, problems, VOCABULARY[entity])
 
         actions = raw.get("actions") or []
         if not isinstance(actions, list):
@@ -254,6 +290,7 @@ def load(path: Path, *, known_actions: set[str] | None = None) -> RulePack:
             note=raw_rule.get("note"),
             condition={k: v for k, v in raw_rule.items() if k in COMBINATORS},
             actions=tuple(raw_rule.get("actions") or ()),
+            entity=raw_rule.get("entity", PROCESS),
         )
         for raw_rule in document["rules"]
     )
@@ -270,6 +307,10 @@ def load(path: Path, *, known_actions: set[str] | None = None) -> RulePack:
 # --------------------------------------------------------------------------
 # Evaluation
 # --------------------------------------------------------------------------
+
+
+#: Finding identifiers say what kind of thing they are about at a glance.
+_PREFIX = {"process": "PROC", "module": "KERN", "service": "SVC"}
 
 
 def matches(condition: dict, signals: set[str]) -> bool:
@@ -302,16 +343,35 @@ REASON = {
     "network": "holds a network endpoint",
     "network_external": "connected to a routable external address",
     "unusual_parent": "parent process is not the one Windows creates it from",
+    # Module.
+    "loaded": "present in the loaded module list",
+    "scanned": "recovered by pool scan",
+    "scanned_only": "recovered by pool scan, absent from the loaded module list",
+    "unbacked_driver": "driver object whose start address matches no known module",
+    "known_exception": "driver upstream recognises as a benign exception",
+    "owns_callback": "owns a kernel callback",
+    "unresolved_callback": "kernel callback owned by no identifiable module",
+    "ssdt_hook": "system-call table entry points outside the kernel",
+    "no_disk_path": "loaded module has no backing file path",
+    # Service.
+    "service_running": "service is running",
+    "svcdiff_only": "present in the registry but not in the service manager's list",
+    "service_binary_in_user_path": "service binary lives in a user-writable directory",
+    "service_no_binary": "service record names no binary",
+    "service_host_injected": "the process hosting this service has unbacked "
+                             "executable memory",
+    "service_host_hidden": "the process hosting this service is hidden from the "
+                           "active process list",
 }
 
 
-def evidence_for(signal: str, process: Process) -> dict | None:
+def evidence_for(signal: str, entity: Entity) -> dict | None:
     """One evidence entry, citing the row that produced the signal."""
     plugin = SIGNAL_SOURCE.get(signal)
     if plugin is None:
         return None
 
-    rows = process.rows(plugin)
+    rows = entity.rows(plugin)
     reason = REASON.get(signal, signal)
 
     # Say which address, rather than making the analyst open the file to find it.
@@ -326,7 +386,13 @@ def evidence_for(signal: str, process: Process) -> dict | None:
                 return {"plugin": plugin, "reason": reason, "row": row}
 
     if signal == "unusual_parent":
-        reason = f"{reason} (PPID {process.ppid})"
+        reason = f"{reason} (PPID {getattr(entity, 'ppid', None)})"
+    if signal == "service_binary_in_user_path":
+        reason = f"{reason}: {getattr(entity, 'binary', None)}"
+    if signal in ("service_host_injected", "service_host_hidden"):
+        # The evidence lives on the host process, not on the service record.
+        reason = f"{reason} (PID {getattr(entity, 'pid', None)})"
+        return {"plugin": plugin, "reason": reason, "row": None}
 
     return {
         "plugin": plugin,
@@ -357,14 +423,14 @@ def evaluate(pack: RulePack, analysis: Analysis) -> list[Finding]:
     for rule in pack.rules:
         if rule.id in blocked:
             continue
-        for process in analysis.processes:
-            if not matches(rule.condition, process.signals):
+        for entity in analysis.entities(rule.entity):
+            if not matches(rule.condition, entity.signals):
                 continue
             evidence = [
                 entry
                 for entry in (
-                    evidence_for(signal, process)
-                    for signal in sorted(rule.signals() & process.signals)
+                    evidence_for(signal, entity)
+                    for signal in sorted(rule.signals() & entity.signals)
                 )
                 if entry is not None
             ]
@@ -374,15 +440,22 @@ def evaluate(pack: RulePack, analysis: Analysis) -> list[Finding]:
                     rule_id=rule.id,
                     severity=rule.severity,
                     title=rule.title,
-                    process=process,
+                    entity=entity,
                     evidence=evidence,
                     actions=rule.actions,
                 )
             )
 
-    findings.sort(key=lambda f: (SEVERITIES.index(f.severity), f.process.pid))
-    for index, finding in enumerate(findings, start=1):
-        finding.finding_id = f"PROC-{index:04d}"
+    findings.sort(
+        key=lambda f: (SEVERITIES.index(f.severity), f.entity.kind, f.entity.sort_key)
+    )
+    # Numbered within each prefix, so PROC-0003 is the third process finding
+    # rather than the third finding that happens to be about a process.
+    counters: dict[str, int] = {}
+    for finding in findings:
+        prefix = _PREFIX[finding.entity.kind]
+        counters[prefix] = counters.get(prefix, 0) + 1
+        finding.finding_id = f"{prefix}-{counters[prefix]:04d}"
     return findings
 
 
@@ -418,7 +491,11 @@ def document(pack: RulePack, analysis: Analysis, findings: list[Finding]) -> dic
             "sha256": pack.sha256,
         },
         "summary": summarise(findings),
-        "processes_examined": len(analysis.processes),
+        "entities_examined": {
+            "process": len(analysis.processes),
+            "module": len(analysis.modules),
+            "service": len(analysis.services),
+        },
         "plugins_read": analysis.plugins_read,
         "plugins_missing": analysis.plugins_missing,
         "not_evaluated": not_evaluated(pack, analysis),
@@ -431,9 +508,9 @@ CSV_COLUMNS = (
     "severity",
     "rule_id",
     "title",
+    "entity_type",
+    "entity",
     "pid",
-    "process",
-    "offset",
     "evidence",
     "recommended_actions",
 )
@@ -450,6 +527,10 @@ def write(findings_dir: Path, pack: RulePack, analysis: Analysis,
         encoding="utf-8",
     )
 
+    (findings_dir / "findings.txt").write_text(
+        report(pack, analysis, findings) + "\n", encoding="utf-8"
+    )
+
     csv_path = findings_dir / "findings.csv"
     with open(csv_path, "w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
@@ -461,12 +542,77 @@ def write(findings_dir: Path, pack: RulePack, analysis: Analysis,
                     finding.severity,
                     finding.rule_id,
                     finding.title,
-                    finding.process.pid,
-                    finding.process.name or "",
-                    hex(finding.process.offset) if finding.process.offset else "",
+                    finding.entity.kind,
+                    finding.entity.label,
+                    getattr(finding.entity, "pid", "") or "",
                     "; ".join(e["reason"] for e in finding.evidence),
                     " ".join(finding.actions),
                 ]
             )
 
     return json_path, csv_path
+
+
+def report(pack: RulePack, analysis: Analysis, findings: list[Finding]) -> str:
+    """A findings summary meant to be read rather than parsed.
+
+    findings.csv is a table; this is the paragraph an examiner writes at the top
+    of a report. It groups by entity rather than by rule, because the question
+    being asked is "what should I look at" and not "which rules fired".
+    """
+    lines = [
+        "FINDINGS",
+        "=" * 72,
+        f"Rule pack {pack.name} {pack.version} (sha256 {pack.sha256[:12]})",
+        f"{len(analysis.processes)} process(es), {len(analysis.modules)} module(s), "
+        f"{len(analysis.services)} service(s) examined",
+        "",
+    ]
+
+    summary = summarise(findings)
+    if not findings:
+        lines.append("No rules matched.")
+    else:
+        lines.append(
+            "  ".join(f"{summary[s]} {s}" for s in SEVERITIES if summary[s])
+        )
+    lines.append("")
+
+    grouped: dict[tuple, list[Finding]] = {}
+    for finding in findings:
+        grouped.setdefault((finding.entity.kind, finding.entity.sort_key), []).append(
+            finding
+        )
+
+    for group in grouped.values():
+        entity = group[0].entity
+        worst = min(group, key=lambda f: SEVERITIES.index(f.severity)).severity
+        lines.append(f"{entity.label}  [{worst}]")
+        for finding in group:
+            lines.append(f"    {finding.finding_id}  {finding.title}")
+            for item in finding.evidence:
+                # A single-signal rule's title already says what the evidence
+                # says. Repeating it adds length without adding information.
+                if item["reason"].lower().rstrip(".") == finding.title.lower():
+                    lines.append(f"        - {item['plugin'].rsplit('.', 1)[-1]}")
+                    continue
+                plugin = item["plugin"].rsplit(".", 1)[-1]
+                lines.append(f"        - {item['reason']}  [{plugin}]")
+        actions = sorted({a for f in group for a in f.actions})
+        if actions:
+            lines.append(f"    next: {', '.join(actions)}")
+        lines.append("")
+
+    blocked = not_evaluated(pack, analysis)
+    if blocked:
+        lines.append("NOT EVALUATED")
+        lines.append("-" * 72)
+        lines.append(
+            "These rules could not run, so their absence from the findings above "
+            "means nothing."
+        )
+        for rule_id, reason in sorted(blocked.items()):
+            lines.append(f"  {rule_id}: {reason}")
+        lines.append("")
+
+    return "\n".join(lines)

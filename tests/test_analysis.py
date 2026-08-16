@@ -130,7 +130,7 @@ class TestExtractorDrift:
 
     def test_ldrmodules_lowercase_pid_column(self) -> None:
         """The one plugin in the set that spells it 'Pid'."""
-        assert analysis.BY_PLUGIN["windows.malware.ldrmodules.LdrModules"].pid == "Pid"
+        assert analysis.BY_PLUGIN["windows.malware.ldrmodules.LdrModules"].key == "Pid"
 
 
 class TestCorrelation:
@@ -218,11 +218,17 @@ class TestSignals:
         assert "peb_masquerade" in target.signals
 
     def test_every_signal_emitted_is_in_the_vocabulary(self, analysed) -> None:
-        for process in analysed.processes:
-            assert process.signals <= analysis.VOCABULARY
+        """Each entity type may only emit signals from its own vocabulary."""
+        for entity in analysed.all_entities:
+            assert entity.signals <= analysis.VOCABULARY[entity.kind], entity.label
 
     def test_every_vocabulary_entry_has_a_source_plugin(self) -> None:
-        assert set(analysis.SIGNAL_SOURCE) == analysis.VOCABULARY
+        assert set(analysis.SIGNAL_SOURCE) == analysis.ALL_SIGNALS
+
+    def test_the_vocabularies_do_not_overlap(self) -> None:
+        """Signal names are unique across types, so SIGNAL_SOURCE can stay flat."""
+        total = sum(len(v) for v in analysis.VOCABULARY.values())
+        assert total == len(analysis.ALL_SIGNALS)
 
 
 class TestExternalAddresses:
@@ -287,19 +293,37 @@ class TestAgainstInstalledVolatility:
         assert not missing, f"renamed or removed upstream: {missing}"
 
     def test_extracted_columns_match_the_plugins_treegrid(self, catalogue) -> None:
-        """The column each extractor reads must be one the plugin emits."""
+        """The column each extractor reads must be one the plugin emits.
+
+        ModScan and SvcDiff subclass Modules and SvcScan and reuse the parent's
+        grid, so the search walks the MRO rather than the class alone.
+        """
         import inspect
         import re
 
-        for extractor in analysis.EXTRACTORS:
-            source = inspect.getsource(catalogue[extractor.plugin])
-            grid = re.search(r"TreeGrid\(\s*(?:columns\s*=\s*)?\[(.*?)\]\s*,",
-                             source, re.S)
-            assert grid, f"cannot find the TreeGrid for {extractor.plugin}"
-            columns = re.findall(r'\(\s*f?"([^"]+)"', grid.group(1))
+        def columns_of(plugin_class) -> list[str]:
+            for klass in plugin_class.__mro__:
+                try:
+                    source = inspect.getsource(klass)
+                except (OSError, TypeError):
+                    continue
+                grid = re.search(r"TreeGrid\(\s*(?:columns\s*=\s*)?\[(.*?)\]\s*,",
+                                 source, re.S)
+                if grid:
+                    return re.findall(r'\(\s*f?"([^"]+)"', grid.group(1))
+            return []
 
-            wanted = [extractor.pid, extractor.name, extractor.ppid]
-            for column in filter(None, wanted):
+        for extractor in analysis.EXTRACTORS:
+            columns = columns_of(catalogue[extractor.plugin])
+            assert columns, f"cannot find the TreeGrid for {extractor.plugin}"
+
+            # The identity column may be either of the two the extractor knows.
+            identity = [extractor.key] + ([extractor.alt_key]
+                                          if extractor.alt_key else [])
+            assert any(c in columns for c in identity), (
+                f"{extractor.plugin} has none of {identity}; it now has {columns}"
+            )
+            for column in filter(None, [extractor.name, extractor.ppid]):
                 assert column in columns, (
                     f"{extractor.plugin} no longer has a {column!r} column; "
                     f"it now has {columns}"

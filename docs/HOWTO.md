@@ -126,7 +126,12 @@ The main command.
 | `--pagefile PATH` | none | Include a pagefile as a swap layer; repeat for several |
 | `--no-hash` | off | Skip the custody SHA-256 of the image |
 | `--force` | off | Run even if symbols are missing or the probe fails |
+| `--follow-up` | off | Analyse the results afterwards and collect the follow-up evidence |
 | `--output PATH` | cwd | Where to write `symbol_request.json` if symbols are missing |
+
+`--follow-up` runs the same analyser as `analyze` on the folder just written, with the
+image already to hand. Useful when you have one shot at the machine; `analyze` on its own
+is the better tool once the output folder exists, because it re-runs in seconds.
 
 ### `analyze` — turn a finished run into findings
 
@@ -167,6 +172,13 @@ large process run to gigabytes. Dumps are therefore planned and recorded in
 
 A rule pack named `rules.json` sitting in the output folder is used in preference to the
 bundled one, which is reported at the top of the run and recorded in every finding.
+
+**What it looks at.** Rules run against three kinds of thing, and a finding's identifier
+says which: `PROC-` for a process, `KERN-` for a kernel module or driver, `SVC-` for a
+service. The shipped pack has fifteen rules across all three — process injection and
+hiding, kernel modules missing from the loaded list, SSDT hooks, unbacked drivers, and
+services that are hidden, run from a user-writable path, or are hosted by a process with
+injected code in it.
 
 ### `symbols` — report what symbols the image needs
 
@@ -335,7 +347,8 @@ output\<image name>\
 ├─ analysis-manifest.json
 ├─ findings\
 │  ├─ findings.json          the machine interface
-│  ├─ findings.csv           the same findings, for reading
+│  ├─ findings.csv           the same findings, as a table
+│  ├─ findings.txt           the same findings, written to be read
 │  └─ next-steps.json        what was planned, and whether it ran
 └─ followup\
    ├─ PID-4180\
