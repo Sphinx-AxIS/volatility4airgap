@@ -321,3 +321,71 @@ class TestScopedTaskConstruction:
         assert tasks[0].command[-3:] == [
             "windows.modules.Modules", "--name", "evilrk"
         ]
+
+
+class TestPagefilesReachTheFollowUp:
+    """Triage's swap layers must reach the targeted runs, or the collected
+    evidence is narrower than the findings that asked for it."""
+
+    def test_swap_layers_are_passed_to_every_task(self, lib, tmp_path) -> None:
+        plan = followup.plan([finding(4180, actions=("inspect_vads",))])
+        tasks = followup.build_tasks(
+            plan, image=tmp_path / "m.raw", output_dir=tmp_path / "out",
+            engine=lib, symbols_dir=tmp_path / "s", cache_dir=tmp_path / "c",
+            pagefiles=[tmp_path / "pagefile.sys"],
+        )
+
+        argv = tasks[0].command
+        assert "--single-swap-locations" in argv
+        assert str(tmp_path / "pagefile.sys") in argv
+
+    def test_the_swap_list_never_swallows_the_plugin(self, lib, tmp_path) -> None:
+        """--single-swap-locations takes nargs='*'; see TestSwapLayers."""
+        plan = followup.plan([finding(4180, actions=("inspect_vads",))])
+        tasks = followup.build_tasks(
+            plan, image=tmp_path / "m.raw", output_dir=tmp_path / "out",
+            engine=lib, symbols_dir=tmp_path / "s", cache_dir=tmp_path / "c",
+            pagefiles=[tmp_path / "pagefile.sys"],
+        )
+        argv = tasks[0].command
+
+        swap = argv.index("--single-swap-locations")
+        assert "windows.vadinfo.VadInfo" in argv[swap + 2:]
+        assert argv[-3:] == ["windows.vadinfo.VadInfo", "--pid", "4180"]
+
+    def test_absent_when_the_run_used_none(self, lib, tmp_path) -> None:
+        plan = followup.plan([finding(4180, actions=("inspect_vads",))])
+        tasks = followup.build_tasks(
+            plan, image=tmp_path / "m.raw", output_dir=tmp_path / "out",
+            engine=lib, symbols_dir=tmp_path / "s", cache_dir=tmp_path / "c",
+        )
+
+        assert "--single-swap-locations" not in tasks[0].command
+
+
+class TestModuleFollowUpName:
+    def test_the_case_preserving_name_reaches_the_argv(self, lib, tmp_path) -> None:
+        """The lowercased key would match nothing: --name is case-sensitive."""
+        entity = analysis.Module(key="wdf01000", name="Wdf01000.sys",
+                                 scope_name="Wdf01000")
+        found = rules.Finding("KERN-0001", "K-1", "high", "t", entity,
+                              actions=("inspect_module",))
+        tasks = followup.build_tasks(
+            followup.plan([found]), image=tmp_path / "m.raw",
+            output_dir=tmp_path / "out", engine=lib,
+            symbols_dir=tmp_path / "s", cache_dir=tmp_path / "c",
+        )
+
+        assert tasks[0].command[-1] == "Wdf01000"
+
+    def test_the_directory_still_uses_the_stable_key(self, lib, tmp_path) -> None:
+        """Case-folded, so two spellings cannot make two evidence folders."""
+        entity = analysis.Module(key="wdf01000", name="Wdf01000.sys",
+                                 scope_name="Wdf01000")
+        found = rules.Finding("KERN-0001", "K-1", "high", "t", entity,
+                              actions=("inspect_module",))
+
+        assert followup.plan([found]).tasks[0].directory == "followup/KERN-wdf01000"
+
+    def test_it_falls_back_to_the_key_when_no_stem_is_known(self) -> None:
+        assert analysis.Module(key="evilrk").scope_values() == {"name": "evilrk"}

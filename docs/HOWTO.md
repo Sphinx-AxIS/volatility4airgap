@@ -130,7 +130,7 @@ The main command.
 | `--output PATH` | cwd | Where to write `symbol_request.json` if symbols are missing |
 
 `--follow-up` runs the same analyser as `analyze` on the folder just written, with the
-image already to hand. Useful when you have one shot at the machine; `analyze` on its own
+image and any `--pagefile` already to hand. Useful when you have one shot at the machine; `analyze` on its own
 is the better tool once the output folder exists, because it re-runs in seconds.
 
 ### `analyze` — turn a finished run into findings
@@ -158,11 +158,30 @@ follow-up Volatility commands the findings imply, filed under `followup\PID-<n>\
 | `--engine NAME` | `auto` | `library`, `exe`, or `auto` |
 | `--symbols DIR` | `symbols\` | Where to look for ISF symbol files |
 | `--timeout SECONDS` | `3600` | Per-task limit before the process is killed |
-| `--no-hash` | off | Skip checking the image against the triage manifest |
+| `--pagefile PATH` | from manifest | Where the run's pagefile lives now, if it has moved |
+| `--no-pagefile` | off | Run follow-ups without the swap layer triage used |
+| `--allow-modified-input` | off | Analyse plugin output that no longer matches the manifest |
+| `--no-hash` | off | Skip checking the image and pagefiles against the manifest |
 
-The image is checked against the SHA-256 in `run-manifest.json` before any follow-up
-runs. A mismatch stops the run: the findings describe a different capture, so PID 4180
-there means something else here.
+**Three things are checked before a follow-up runs**, because evidence gathered against
+the wrong inputs is worse than no evidence at all.
+
+*The plugin output.* `run-manifest.json` records a SHA-256 for every file the run
+produced. Those are checked before anything is read, so the findings can be tied to the
+exact bytes triage attested to. A file that has changed, or one added afterwards and
+never recorded, stops the run with exit code 6. `--allow-modified-input` overrides that,
+and the override itself is recorded in `analysis-manifest.json`.
+
+*The image.* Checked against the SHA-256 in `run-manifest.json`. A mismatch stops the
+run: the findings describe a different capture, so PID 4180 there means something else
+here.
+
+*The pagefile.* If triage used `--pagefile`, the follow-up uses the same one, verified by
+digest. This matters more than it looks. A VAD, DLL or handle that resolved during triage
+only because the swap layer supplied the paged-out bytes will simply be missing from a
+follow-up run without it — so the targeted collection would quietly contradict the
+finding that asked for it. If the file has moved, point at it with `--pagefile`. If you
+genuinely cannot supply it, `--no-pagefile` proceeds and says what is being given up.
 
 **On `--dump`.** Dump actions write process executables and VAD contents to disk. Two
 consequences on a live workstation: a dumped malicious PE will very likely be
@@ -388,7 +407,8 @@ diagnostic is lost. If a plugin you expected is absent from the output folder, c
 | `2` | Bad input | Fix the path or option named in the error |
 | `3` | Symbols missing | Run `fetch-symbols` on a connected machine |
 | `4` | Probe failed | Read the diagnosis; `--force` to run anyway |
-| `5` | `analyze --image` does not match the triage run | Supply the image that was triaged |
+| `5` | `analyze` evidence does not match the triage run | Supply the image and pagefile that were triaged |
+| `6` | Plugin output does not match `run-manifest.json` | Re-run triage, or `--allow-modified-input` |
 
 Useful in a batch file:
 

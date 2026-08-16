@@ -148,6 +148,7 @@ LOADED = [
     ("ntoskrnl.exe", "\\SystemRoot\\system32\\ntoskrnl.exe"),
     ("tcpip.sys", "\\SystemRoot\\System32\\drivers\\tcpip.sys"),
     ("ndis.sys", "\\SystemRoot\\System32\\drivers\\ndis.sys"),
+    ("Wdf01000.sys", "\\SystemRoot\\System32\\drivers\\Wdf01000.sys"),
 ]
 write("windows.modules.Modules.json",
       [module_row(n, p, offset=0xA0000000 + i * 0x1000)
@@ -210,22 +211,49 @@ write("windows.svcscan.SvcScan.json", [
     # Persistence pattern: SYSTEM service running a binary a user can write.
     service_row(4, 2100, "UpdaterSvc",
                 "C:\\Users\\jdoe\\AppData\\Local\\Temp\\upd.exe"),
+    # Recovered by the pool scan SvcScan performs, so it appears here as well as
+    # in SvcDiff below. PID 0 leaves it with no host to scope a follow-up by.
+    service_row(9, 0, "GhostSvc", "C:\\Windows\\system32\\ghost.exe"),
 ])
 
-# Present in the registry, absent from the service manager's own list.
+# SvcDiff yields only `from_scan - from_list`: services the pool scan recovers
+# that walking the service manager's list does not report. Every row is already
+# the anomaly, and every row also appears in SvcScan above.
 write("windows.malware.svcdiff.SvcDiff.json", [
     service_row(9, 0, "GhostSvc", "C:\\Windows\\system32\\ghost.exe"),
 ])
 
-(OUT / "run-manifest.json").write_text(json.dumps({
+# The manifest must attest to the files beside it, or analyse() has nothing to
+# verify its inputs against. Written last, and excluding itself, exactly as
+# manifest.build does.
+import hashlib
+
+MANIFEST = OUT / "run-manifest.json"
+outputs = []
+for path in sorted(p for p in OUT.rglob("*") if p.is_file() and p != MANIFEST):
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    outputs.append({
+        "file": path.relative_to(OUT).as_posix(),
+        "size_bytes": path.stat().st_size,
+        "sha256": digest,
+    })
+
+MANIFEST.write_text(json.dumps({
     "schema_version": 1,
     "tool_version": "0.1.0",
     "image": {"path": "D:\\memory.raw", "name": "memory.raw",
               "size_bytes": 34359738368,
               "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+    # A run that used a swap layer. The follow-up must use the same one, or it
+    # reads a different memory image than the findings describe.
+    "pagefiles": [{
+        "path": "D:\\pagefile.sys",
+        "size_bytes": 8589934592,
+        "sha256": "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8",
+    }],
     "plugins": [],
     "summary": {"total": 0, "succeeded": 0, "failed": 0},
-    "outputs": [],
+    "outputs": outputs,
 }, indent=2) + "\n")
 
 print(f"wrote {len(list(OUT.glob('*.json')))} files to {OUT}")

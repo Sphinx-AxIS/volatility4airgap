@@ -385,6 +385,49 @@ be absurd. A test asserts the two entry points share the one code path.
 **`findings.txt`** joins the JSON and CSV: the same findings grouped by entity and
 written to be read, with a section naming the rules that could not run.
 
+## Third pass: correctness review
+
+Four defects found in review, all of which would have mattered in real work.
+
+**SVC-HIDDEN was dead code.** The signal assumed SvcDiff walks the registry and so
+required "in SvcDiff, not in SvcScan". Upstream actually compares
+`SvcScan.service_scan()` against `SvcList.service_list()` and yields only
+`from_scan - from_list`. Every SvcDiff row is therefore *also* a SvcScan row, and the
+condition could never be true. Presence alone is now the whole signal, renamed
+`svcdiff_hidden`. Worth knowing: SvcDiff runs only on Windows 10 15063+ 64-bit and
+yields nothing otherwise, which reads here the same as finding nothing.
+
+**Follow-ups dropped the pagefile.** `analyze` had no `--pagefile`, never passed
+`pagefiles=` to `build_tasks`, and `triage --follow-up` did not carry `args.pagefile`
+into the chained call. So `triage --pagefile X --follow-up` triaged RAM-plus-swap and
+then followed up on RAM alone. A VAD, DLL or handle that resolved only because the swap
+layer supplied the paged-out bytes would be silently absent from the targeted
+collection, contradicting the finding that requested it.
+
+The set is now taken from `run-manifest.json` rather than from what the analyst types,
+each file verified against its recorded digest, and the resolved paths recorded in
+`analysis-manifest.json`. `--pagefile` relocates a file that has moved; `--no-pagefile`
+proceeds without and states what is given up. A test asserts every `analyze` argument is
+supplied by the `triage --follow-up` chain, so a new flag cannot silently default.
+
+**Module follow-ups used a lowercased filter.** `scope_values()` returned the correlation
+key, but Modules filters with `self.config["name"] not in BaseDllName` — a case-sensitive
+substring test, inherited by ModScan. `--name wdf01000` matches no `Wdf01000.sys`, so the
+follow-up folder comes back empty with nothing to explain it. `Module` now carries both:
+`key` stays lowercased for correlation and directory naming, `scope_name` preserves case
+for the filter, and a BaseDllName from Modules or ModScan always wins over a driver
+object's name because it is the exact string the filter compares against.
+
+**Plugin JSON was read without checking its digest.** The run manifest hashes every
+output so a consumer can prove nothing changed, and the analyser ignored that, which made
+`analysis-manifest.json` attest to findings derived from unverified bytes. `verify_inputs`
+now checks each file it is about to read; a modified or unattested file fails closed with
+exit code 6, `--allow-modified-input` overrides, and the override is itself recorded.
+
+Two smaller items: `--max-followups` is validated at parse rather than at the slice, where
+a negative value silently dropped the least severe entity; and `cmd_analyze` catches the
+`ValueError` from `resolve_jobs` like `cmd_triage` already did.
+
 ## Still out of scope
 
 - **File entities.** FileScan and MutantScan produce entities readily enough, but no

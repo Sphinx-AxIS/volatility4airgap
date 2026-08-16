@@ -115,6 +115,8 @@ def build_analysis(
     not_evaluated: dict,
     plugins_missing: dict,
     followups_executed: int,
+    input_check: dict,
+    pagefiles: list,
     started_utc: str,
 ) -> dict:
     """The analysis manifest, written beside the run manifest rather than into it.
@@ -158,7 +160,13 @@ def build_analysis(
             "sha256": (
                 sha256_file(triage_manifest) if triage_manifest.is_file() else None
             ),
+            # Naming the manifest proves which run was referenced. This proves
+            # the plugin output beside it still matched what that run attested.
+            "inputs": input_check,
         },
+        # The swap layers the follow-ups actually read. Omitting one that triage
+        # used makes the collected evidence narrower than the findings assume.
+        "pagefiles": pagefiles,
         "rule_pack": rule_pack,
         "findings": findings_summary,
         "rules_not_evaluated": not_evaluated,

@@ -355,7 +355,8 @@ REASON = {
     "no_disk_path": "loaded module has no backing file path",
     # Service.
     "service_running": "service is running",
-    "svcdiff_only": "present in the registry but not in the service manager's list",
+    "svcdiff_hidden": "recovered by pool scan but absent from the service "
+                      "manager's own list",
     "service_binary_in_user_path": "service binary lives in a user-writable directory",
     "service_no_binary": "service record names no binary",
     "service_host_injected": "the process hosting this service has unbacked "

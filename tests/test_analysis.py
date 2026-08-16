@@ -341,3 +341,125 @@ class TestFixtureIntegrity:
         """findings/ and followup/ are outputs; committing them would be circular."""
         assert not (FIXTURE / "findings").exists()
         assert not (FIXTURE / "followup").exists()
+
+
+class TestSvcDiffSemantics:
+    """SvcDiff yields `from_scan - from_list`, not a registry comparison.
+
+    Upstream calls SvcScan.service_scan() and SvcList.service_list() and emits
+    only the difference, so every row it produces is already the anomaly — and
+    is by construction also a SvcScan row. An earlier version of this signal
+    required "in SvcDiff and not in SvcScan", which could never be true.
+    """
+
+    def test_presence_alone_is_the_signal(self, analysed) -> None:
+        (ghost,) = [s for s in analysed.services if s.key == "ghostsvc"]
+
+        assert "svcdiff_hidden" in ghost.signals
+
+    def test_it_fires_even_though_svcscan_also_saw_it(self, analysed) -> None:
+        """The regression: requiring absence from SvcScan made this dead code."""
+        (ghost,) = [s for s in analysed.services if s.key == "ghostsvc"]
+
+        assert ghost.rows("windows.svcscan.SvcScan")
+        assert ghost.rows("windows.malware.svcdiff.SvcDiff")
+        assert "svcdiff_hidden" in ghost.signals
+
+    def test_an_ordinary_service_does_not_fire(self, analysed) -> None:
+        (dhcp,) = [s for s in analysed.services if s.key == "dhcp"]
+        assert "svcdiff_hidden" not in dhcp.signals
+
+
+class TestModuleFilterName:
+    """--name is a case-sensitive substring test, so the key cannot be reused.
+
+    Modules filters with `self.config["name"] not in BaseDllName`, inherited by
+    ModScan. Passing the lowercased correlation key means a follow-up on
+    Wdf01000.sys matches nothing and returns an empty folder with no error.
+    """
+
+    def test_the_correlation_key_stays_lowercase(self, analysed) -> None:
+        (module,) = [m for m in analysed.modules if m.key == "wdf01000"]
+        assert module.key == "wdf01000"
+
+    def test_the_filter_name_preserves_case(self, analysed) -> None:
+        (module,) = [m for m in analysed.modules if m.key == "wdf01000"]
+        assert module.scope_values() == {"name": "Wdf01000"}
+
+    def test_the_filter_name_would_match_the_basedllname(self, analysed) -> None:
+        """Mirrors upstream's test exactly: `config["name"] not in BaseDllName`."""
+        (module,) = [m for m in analysed.modules if m.key == "wdf01000"]
+        name = module.scope_values()["name"]
+
+        assert name in "Wdf01000.sys"
+        assert module.key not in "Wdf01000.sys", "the key alone would not match"
+
+    def test_a_basedllname_source_wins_over_a_driver_object_name(self) -> None:
+        """DriverScan may name a module first; only Modules reports BaseDllName."""
+        rows = {
+            "windows.driverscan.DriverScan": [
+                {"Driver Name": "\\Driver\\Wdf01000", "Name": "Wdf01000"}
+            ],
+            "windows.modules.Modules": [
+                {"Name": "Wdf01000.sys", "Path": "\\SystemRoot\\x.sys"}
+            ],
+        }
+        result = analysis.Analysis()
+        analysis.build_entities(rows, result)
+        (module,) = result.modules
+
+        assert module.scope_values() == {"name": "Wdf01000"}
+
+    def test_paths_and_extensions_are_stripped_case_intact(self) -> None:
+        assert analysis.module_stem("\\Driver\\EvilRk") == "EvilRk"
+        assert analysis.module_stem("NTOSKRNL.EXE") == "NTOSKRNL"
+        assert analysis.module_stem(None) is None
+
+
+class TestInputVerification:
+    """The run manifest hashed every output so a consumer could check them."""
+
+    def test_a_clean_folder_verifies(self, sample) -> None:
+        check = analysis.verify_inputs(sample)
+
+        assert check.ok
+        assert len(check.verified) == 20
+        assert not check.manifest_absent
+
+    def test_a_modified_plugin_output_is_caught(self, sample) -> None:
+        path = sample / "windows.pslist.PsList.json"
+        rows = json.loads(path.read_text())
+        rows[0]["ImageFileName"] = "innocent.exe"
+        path.write_text(json.dumps(rows))
+
+        check = analysis.verify_inputs(sample)
+
+        assert not check.ok
+        assert check.modified == ["windows.pslist.PsList.json"]
+
+    def test_an_unattested_file_is_caught(self, sample) -> None:
+        """A plugin re-run after the fact is not covered by the custody record."""
+        (sample / "windows.netstat.NetStat.json").write_text("[]")
+
+        check = analysis.verify_inputs(sample)
+
+        assert not check.ok
+        assert check.unattested == ["windows.netstat.NetStat.json"]
+
+    def test_a_changed_log_does_not_invalidate_the_findings(self, sample) -> None:
+        """Only the files analysis actually reads are checked."""
+        (sample / "logs").mkdir(exist_ok=True)
+        (sample / "logs" / "note.log").write_text("added later")
+
+        assert analysis.verify_inputs(sample).ok
+
+    def test_a_folder_without_a_manifest_is_reported_not_failed(self, sample) -> None:
+        (sample / "run-manifest.json").unlink()
+        check = analysis.verify_inputs(sample)
+
+        assert check.manifest_absent
+        assert check.as_dict()["manifest_present"] is False
+
+    def test_a_manifest_with_no_digests_is_treated_as_absent(self, sample) -> None:
+        (sample / "run-manifest.json").write_text('{"outputs": []}')
+        assert analysis.verify_inputs(sample).manifest_absent

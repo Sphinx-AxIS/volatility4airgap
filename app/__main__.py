@@ -372,6 +372,11 @@ def cmd_triage(args: argparse.Namespace) -> int:
             validate_rules=False,
             max_followups=10,
             dump=False,
+            # The same swap layers triage just used. Without these the
+            # follow-up reads a narrower image than the findings describe.
+            pagefile=[str(p) for p in pagefiles] or None,
+            no_pagefile=False,
+            allow_modified_input=False,
             symbols=args.symbols,
             jobs=args.jobs,
             engine=args.engine,
@@ -383,6 +388,85 @@ def cmd_triage(args: argparse.Namespace) -> int:
             return code
 
     return 0 if not failed else 1
+
+
+def _read_triage_manifest(output_dir: Path) -> dict | None:
+    import json
+
+    from . import manifest
+
+    path = output_dir / manifest.FILENAME
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _resolve_pagefiles(
+    output_dir: Path, args: argparse.Namespace
+) -> tuple[list[Path], bool]:
+    """The swap layers the triage run used, verified against its manifest.
+
+    A follow-up that omits a pagefile reads a different memory image than the
+    findings describe. A VAD, DLL or handle that resolved during triage because
+    the swap layer supplied the paged-out bytes will simply be absent, and the
+    targeted collection quietly contradicts the finding that asked for it.
+
+    So the set is taken from ``run-manifest.json`` rather than from whatever the
+    analyst happens to type, and each file is checked against the digest
+    recorded there. ``--pagefile`` overrides the recorded *path* — the file may
+    well have moved — but not the requirement that its contents match.
+    """
+    from . import manifest
+
+    document = _read_triage_manifest(output_dir) or {}
+    recorded = [p for p in document.get("pagefiles", []) if p.get("sha256")]
+
+    supplied = [Path(raw).expanduser() for raw in (args.pagefile or [])]
+
+    if not recorded:
+        if supplied:
+            print("\nwarning: the triage run recorded no pagefile, but "
+                  f"{len(supplied)} was supplied. The follow-up will read a "
+                  "different memory image than the findings describe.",
+                  file=sys.stderr)
+        return supplied, True
+
+    candidates = supplied or [Path(entry["path"]) for entry in recorded]
+
+    missing = [p for p in candidates if not p.is_file()]
+    if missing:
+        print(f"\nerror: the triage run used {len(recorded)} pagefile(s) and "
+              "the follow-up must use the same one(s).", file=sys.stderr)
+        for path in missing:
+            print(f"  not found: {path}", file=sys.stderr)
+        print("  Supply them with --pagefile PATH, or accept a narrower "
+              "follow-up with --no-pagefile.", file=sys.stderr)
+        return [], False
+
+    if args.no_hash:
+        print(f"\nUsing {len(candidates)} recorded pagefile(s) without "
+              "verifying (--no-hash).")
+        return candidates, True
+
+    print(f"\nVerifying {len(candidates)} pagefile(s) against the triage "
+          "manifest...")
+    expected = {entry["sha256"] for entry in recorded}
+    actual = {manifest.sha256_file(path) for path in candidates}
+    if actual != expected:
+        print("\nerror: pagefile contents do not match the triage run.",
+              file=sys.stderr)
+        for path in candidates:
+            digest = manifest.sha256_file(path)
+            mark = "ok " if digest in expected else "BAD"
+            print(f"  {mark} {path}  {digest}", file=sys.stderr)
+        print("  Findings derived from a different swap layer cannot be "
+              "followed up against this one.", file=sys.stderr)
+        return [], False
+
+    return candidates, True
 
 
 def _resolve_rule_pack(args: argparse.Namespace, output_dir: Path) -> Path:
@@ -411,6 +495,19 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         print(f"error: not a directory: {output_dir}", file=sys.stderr)
         return 2
 
+    # Validated here rather than at the slice. A negative cap would otherwise
+    # mean "every entity except the least severe" — silently dropping work,
+    # which is worse than either an error or no cap at all.
+    if args.max_followups < 1:
+        print("error: --max-followups must be at least 1", file=sys.stderr)
+        return 2
+
+    try:
+        jobs = scheduler.resolve_jobs(args.jobs)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
     pack_path = _resolve_rule_pack(args, output_dir)
     try:
         pack = rules_mod.load(pack_path, known_actions=set(followup_mod.ACTIONS))
@@ -428,6 +525,33 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         print("Findings will record this.")
 
     started = manifest.utc_now()
+
+    # The run manifest hashed every output precisely so a consumer could prove
+    # they had not changed. Reading them without checking discards that: the
+    # analysis manifest would attest to findings derived from unverified bytes.
+    inputs = analysis_mod.verify_inputs(output_dir)
+    if inputs.manifest_absent:
+        print("\nwarning: no usable digests in run-manifest.json, so the plugin "
+              "output cannot be verified against the run that produced it.",
+              file=sys.stderr)
+    elif not inputs.ok:
+        for name in sorted(inputs.modified):
+            print(f"\nerror: {name} does not match its digest in "
+                  f"{manifest.FILENAME}.", file=sys.stderr)
+        for name in sorted(inputs.unattested):
+            print(f"\nerror: {name} is not recorded in {manifest.FILENAME}; it "
+                  "was added or replaced after the run.", file=sys.stderr)
+        if not args.allow_modified_input:
+            print("\n  Findings derived from these would not be defensible. "
+                  "Re-run triage, or\n  pass --allow-modified-input to analyse "
+                  "them anyway (recorded in the manifest).", file=sys.stderr)
+            return 6
+        print("\nwarning: proceeding with modified input on request. This is "
+              "recorded in analysis-manifest.json.", file=sys.stderr)
+    else:
+        print(f"Verified {len(inputs.verified)} plugin output(s) against "
+              f"{manifest.FILENAME}.")
+
     result = analysis_mod.analyse(output_dir)
 
     for notice in result.notices:
@@ -466,6 +590,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     )
 
     executed = 0
+    followup_pagefiles: list[Path] = []
     if plan.pending and args.image:
         image = Path(args.image).expanduser()
         if not image.is_file():
@@ -474,6 +599,18 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
         if not args.no_hash and not _image_matches(output_dir, image):
             return 5
+
+        pagefiles: list[Path] = []
+        if args.no_pagefile:
+            recorded = (_read_triage_manifest(output_dir) or {}).get("pagefiles")
+            if recorded:
+                print(f"\nwarning: ignoring the {len(recorded)} pagefile(s) the "
+                      "triage run used (--no-pagefile). Paged-out evidence the "
+                      "findings rely on may be unreachable.", file=sys.stderr)
+        else:
+            pagefiles, ok = _resolve_pagefiles(output_dir, args)
+            if not ok:
+                return 5
 
         try:
             engine = engine_mod.select(args.engine, BUNDLE_ROOT)
@@ -491,7 +628,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             engine=engine,
             symbols_dir=symbols_dir,
             cache_dir=BUNDLE_ROOT / "cache",
+            pagefiles=pagefiles,
         )
+        followup_pagefiles = pagefiles
 
         print(f"\nRunning {len(tasks)} follow-up task(s)...")
         done = {"n": 0}
@@ -503,8 +642,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                   f"({task_result.duration:.1f}s)")
 
         results = scheduler.run_tasks(
-            tasks, jobs=scheduler.resolve_jobs(args.jobs), timeout=args.timeout,
-            on_finish=on_finish,
+            tasks, jobs=jobs, timeout=args.timeout, on_finish=on_finish,
         )
         followup_mod.record_results(plan, results)
         executed = sum(1 for r in results if r.ok)
@@ -530,6 +668,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             not_evaluated=blocked,
             plugins_missing=result.plugins_missing,
             followups_executed=executed,
+            input_check=inputs.as_dict(),
+            pagefiles=[str(p) for p in followup_pagefiles],
             started_utc=started,
         ),
         filename=manifest.ANALYSIS_FILENAME,
@@ -968,8 +1108,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout", type=float, default=3600.0, help="per-task timeout in seconds"
     )
     analyze.add_argument(
+        "--pagefile", action="append", default=None, metavar="PATH",
+        help="where the triage run's pagefile lives now, if it has moved",
+    )
+    analyze.add_argument(
+        "--no-pagefile", action="store_true",
+        help="run follow-ups without the swap layer triage used",
+    )
+    analyze.add_argument(
+        "--allow-modified-input", action="store_true",
+        help="analyse plugin output that no longer matches the run manifest",
+    )
+    analyze.add_argument(
         "--no-hash", action="store_true",
-        help="skip checking the image against the triage manifest",
+        help="skip checking the image and pagefiles against the triage manifest",
     )
     analyze.set_defaults(func=cmd_analyze)
 

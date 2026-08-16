@@ -141,9 +141,9 @@
       "id": "SVC-HIDDEN",
       "entity": "service",
       "severity": "high",
-      "title": "Service in the registry but not in the service manager's list",
-      "note": "SvcDiff walks the registry rather than the in-memory records, so a service it alone finds is one hidden from the control manager.",
-      "signal": "svcdiff_only",
+      "title": "Service hidden from the service manager's own list",
+      "note": "SvcDiff yields only the difference between scanning for service records and walking the manager's list, so every row it produces is already the anomaly — presence is the whole condition. Note it runs only on Windows 10 15063+ 64-bit; on older images it yields nothing, which reads the same here as finding nothing.",
+      "signal": "svcdiff_hidden",
       "actions": ["inspect_context"]
     },
     {

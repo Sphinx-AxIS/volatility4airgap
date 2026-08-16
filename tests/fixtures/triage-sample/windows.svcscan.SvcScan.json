@@ -55,5 +55,19 @@
     "State": "SERVICE_RUNNING",
     "Type": "SERVICE_WIN32_OWN_PROCESS",
     "__children": []
+  },
+  {
+    "Binary": "C:\\Windows\\system32\\ghost.exe",
+    "Binary (Registry)": "C:\\Windows\\system32\\ghost.exe",
+    "Display": "GhostSvc",
+    "Dll": "",
+    "Name": "GhostSvc",
+    "Offset": 3489660937,
+    "Order": 9,
+    "PID": 0,
+    "Start": "SERVICE_AUTO_START",
+    "State": "SERVICE_RUNNING",
+    "Type": "SERVICE_WIN32_OWN_PROCESS",
+    "__children": []
   }
 ]

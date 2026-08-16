@@ -7,11 +7,119 @@
     "size_bytes": 34359738368,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
+  "pagefiles": [
+    {
+      "path": "D:\\pagefile.sys",
+      "size_bytes": 8589934592,
+      "sha256": "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"
+    }
+  ],
   "plugins": [],
   "summary": {
     "total": 0,
     "succeeded": 0,
     "failed": 0
   },
-  "outputs": []
+  "outputs": [
+    {
+      "file": "windows.callbacks.Callbacks.json",
+      "size_bytes": 382,
+      "sha256": "a7697ecb36e38c47d23128b8695557488083a3c59abc24a5074524bfa05f21e1"
+    },
+    {
+      "file": "windows.cmdline.CmdLine.json",
+      "size_bytes": 1374,
+      "sha256": "b998b04ad952024060693525cbf7445cec68aede578cb0ea188c172814579bb3"
+    },
+    {
+      "file": "windows.driverscan.DriverScan.json",
+      "size_bytes": 401,
+      "sha256": "ff54022b5e41955f621cb4e0927d59e71eb2c1a32add65ec1814b42647334ba4"
+    },
+    {
+      "file": "windows.malware.drivermodule.DriverModule.json",
+      "size_bytes": 368,
+      "sha256": "805d9bc835395299f0fa77227adebebc69612cb7676afd78ea8e5b74f203d2ed"
+    },
+    {
+      "file": "windows.malware.hollowprocesses.HollowProcesses.json",
+      "size_bytes": 142,
+      "sha256": "6b80ad13c1d71c372b9bc7a8b7cb048d414cba66384e954daa1471362452fc30"
+    },
+    {
+      "file": "windows.malware.ldrmodules.LdrModules.json",
+      "size_bytes": 624,
+      "sha256": "7e2fe9cd51b50481aa5ca44de4c7fc6d0258441f51f891a5c676aa1ae65c485c"
+    },
+    {
+      "file": "windows.malware.malfind.Malfind.json",
+      "size_bytes": 690,
+      "sha256": "229b32ef73200339869cf8c673f74241cfd6da6aaae3f2369e2c112394bdb5cd"
+    },
+    {
+      "file": "windows.malware.pebmasquerade.PebMasquerade.json",
+      "size_bytes": 295,
+      "sha256": "ee50b5f5d13ab600e545e66010bf85d2b17ef0fe835ee10b4c59716999547dff"
+    },
+    {
+      "file": "windows.malware.processghosting.ProcessGhosting.json",
+      "size_bytes": 4,
+      "sha256": "a3cbe01dad52836a7ac8efc91954cf64867f4dee8a6f046c4bb0838d11f48589"
+    },
+    {
+      "file": "windows.malware.psxview.PsXView.json",
+      "size_bytes": 560,
+      "sha256": "10c060815b521bcae5f98cba4d89eb324382da16f3bca9bc17d357037742a3e6"
+    },
+    {
+      "file": "windows.malware.suspicious_threads.SuspiciousThreads.json",
+      "size_bytes": 230,
+      "sha256": "c7b18ec69671cb59e75f34f22dd1687011adede5230dbacf06e1265529c5656d"
+    },
+    {
+      "file": "windows.malware.svcdiff.SvcDiff.json",
+      "size_bytes": 375,
+      "sha256": "0dd11e26617489a8502a8e1ac769bd071b9af8c87731ca1a869cdbf13e219179"
+    },
+    {
+      "file": "windows.modscan.ModScan.json",
+      "size_bytes": 1089,
+      "sha256": "cf8001bb687289c83b7ccb091380dca9ff2c7d0af4b6ab2bbb49317e2096942d"
+    },
+    {
+      "file": "windows.modules.Modules.json",
+      "size_bytes": 905,
+      "sha256": "6cb242b26ec95edad3672dbf53d5244088f1e5b0e5109a18dedd5ef2becf25c5"
+    },
+    {
+      "file": "windows.netscan.NetScan.json",
+      "size_bytes": 923,
+      "sha256": "cb42f256f3dee551b065a1471ee2dd55ffdb1b538fbd611a05a9bb1e7d6d7dea"
+    },
+    {
+      "file": "windows.pslist.PsList.json",
+      "size_bytes": 3360,
+      "sha256": "ed2807ea3b5448f8cb6f32db1e14ecf34efb3b147e3d7ff3e41d2b24d7daaefa"
+    },
+    {
+      "file": "windows.psscan.PsScan.json",
+      "size_bytes": 3999,
+      "sha256": "8a8a869780c79b3a8df234f70910014eec0896f891d78ffe142e7d2251754c17"
+    },
+    {
+      "file": "windows.pstree.PsTree.json",
+      "size_bytes": 3476,
+      "sha256": "717d2f07f3a07989537dc5328e83aff8931aa65ae1ae0c06e60738ba5c1064fa"
+    },
+    {
+      "file": "windows.ssdt.SSDT.json",
+      "size_bytes": 287,
+      "sha256": "a65bdd24bc0db98e48aaf5736ca61ef390346ed5d4279a9c8c6383798a656d7b"
+    },
+    {
+      "file": "windows.svcscan.SvcScan.json",
+      "size_bytes": 1975,
+      "sha256": "8b325b1168fd2a2c96fa97ebe82760cb939dd177a0d5661a9ee9a313c1581fde"
+    }
+  ]
 }

@@ -198,6 +198,8 @@ class Module(Entity):
 
     key: str
     name: str | None = None
+    #: Case-preserving stem for Volatility's --name filter. See scope_values.
+    scope_name: str | None = None
     seen_in: dict[str, list[dict]] = field(default_factory=dict)
     signals: set[str] = field(default_factory=set)
 
@@ -212,12 +214,27 @@ class Module(Entity):
         return (self.key,)
 
     def scope_values(self) -> dict[str, str]:
-        # Volatility's --name is a substring match, so the normalised key is a
-        # better argument than the decorated name it came from.
-        return {"name": self.key}
+        """The argument for ``--name``, which is **not** the correlation key.
+
+        Modules filters with ``self.config["name"] not in BaseDllName`` — a
+        case-sensitive Python substring test, inherited by ModScan. Passing the
+        lowercased key would mean ``--name wdf01000`` never matches a
+        ``Wdf01000.sys`` the analyst can see in the triage output, and the
+        follow-up folder would come back empty with no error to explain it.
+
+        ``scope_name`` therefore preserves the case of the source, preferring
+        the BaseDllName that Modules and ModScan report because that is the
+        exact string the filter compares against.
+        """
+        return {"name": self.scope_name or self.key}
 
     def as_entity(self) -> dict:
-        return {"type": MODULE, "key": self.key, "name": self.name}
+        return {
+            "type": MODULE,
+            "key": self.key,
+            "name": self.name,
+            "scope_name": self.scope_name,
+        }
 
 
 @dataclass
@@ -285,6 +302,80 @@ class Analysis:
 # --------------------------------------------------------------------------
 
 
+@dataclass
+class InputCheck:
+    """Whether the plugin JSON still matches what triage attested to.
+
+    ``run-manifest.json`` records a SHA-256 for every file a run produced,
+    precisely so a downstream consumer can prove nothing changed in transit.
+    Reading those files without checking wastes that guarantee: the analysis
+    manifest would then attest to findings derived from bytes nobody verified.
+    """
+
+    verified: list[str] = field(default_factory=list)
+    modified: list[str] = field(default_factory=list)
+    unattested: list[str] = field(default_factory=list)
+    manifest_absent: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return not self.modified and not self.unattested
+
+    def as_dict(self) -> dict:
+        return {
+            "manifest_present": not self.manifest_absent,
+            "verified": len(self.verified),
+            "modified": sorted(self.modified),
+            "unattested": sorted(self.unattested),
+        }
+
+
+def verify_inputs(output_dir: Path) -> InputCheck:
+    """Check every plugin JSON we are about to read against the run manifest.
+
+    Only the files this analysis consumes are checked. Logs and other outputs
+    are hashed in the manifest too, but a changed log does not change a finding.
+    """
+    from . import manifest as manifest_mod
+
+    check = InputCheck()
+    manifest_path = output_dir / manifest_mod.FILENAME
+    if not manifest_path.is_file():
+        check.manifest_absent = True
+        return check
+
+    try:
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        expected = {
+            entry["file"]: entry["sha256"]
+            for entry in document.get("outputs", [])
+            if entry.get("sha256")
+        }
+    except (OSError, ValueError, KeyError, TypeError):
+        check.manifest_absent = True
+        return check
+
+    if not expected:
+        check.manifest_absent = True
+        return check
+
+    for extractor in EXTRACTORS:
+        path = output_json_path(output_dir, extractor.plugin)
+        if not path.is_file():
+            continue
+        relative = path.relative_to(output_dir).as_posix()
+        recorded = expected.get(relative)
+        if recorded is None:
+            # Present but never attested: added or replaced since the run.
+            check.unattested.append(relative)
+        elif manifest_mod.sha256_file(path) == recorded:
+            check.verified.append(relative)
+        else:
+            check.modified.append(relative)
+
+    return check
+
+
 def output_json_path(output_dir: Path, plugin: str) -> Path:
     safe = plugin.replace("/", "_").replace("\\", "_")
     return output_dir / f"{safe}.json"
@@ -349,14 +440,13 @@ def _present(value) -> bool:
     return value not in _ABSENT and value is not None
 
 
-def normalise_module(name) -> str | None:
-    """``\\Driver\\foo``, ``foo.sys`` and ``FOO.SYS`` are one module.
+#: Plugins whose name column is the module's BaseDllName, which is what
+#: Modules and ModScan compare ``--name`` against.
+_BASE_DLL_NAME_SOURCES = ("windows.modules.Modules", "windows.modscan.ModScan")
 
-    Rootkits register drivers from hidden modules, so the driver object and the
-    module usually share a stem even when the decorations differ. Normalising
-    to that stem is what lets DriverModule's verdict land on the same entity
-    that ModScan recovered.
-    """
+
+def module_stem(name) -> str | None:
+    """The name with its path and extension removed, case intact."""
     if not _present(name):
         return None
     text = str(name).strip().replace("/", "\\")
@@ -366,7 +456,19 @@ def normalise_module(name) -> str | None:
         if text.lower().endswith(suffix):
             text = text[: -len(suffix)]
             break
-    return text.lower() or None
+    return text or None
+
+
+def normalise_module(name) -> str | None:
+    """``\\Driver\\foo``, ``foo.sys`` and ``FOO.SYS`` are one module.
+
+    Rootkits register drivers from hidden modules, so the driver object and the
+    module usually share a stem even when the decorations differ. Normalising
+    to that stem is what lets DriverModule's verdict land on the same entity
+    that ModScan recovered.
+    """
+    stem = module_stem(name)
+    return stem.lower() if stem else None
 
 
 # --------------------------------------------------------------------------
@@ -477,6 +579,15 @@ def _build_modules(
             if module.name is None and _present(raw):
                 module.name = str(raw)
 
+            # A BaseDllName always wins, even if a driver object named this
+            # module first: it is the only string --name is actually compared
+            # against.
+            authoritative = plugin in _BASE_DLL_NAME_SOURCES
+            if module.scope_name is None or authoritative:
+                stem = module_stem(raw)
+                if stem and (authoritative or module.scope_name is None):
+                    module.scope_name = stem
+
         _report_drift(plugin, extractor, rows_by_plugin[plugin], recognised, analysis)
 
     return sorted(entities.values(), key=lambda m: m.sort_key)
@@ -556,7 +667,7 @@ VOCABULARY: dict[str, frozenset[str]] = {
     ),
     SERVICE: frozenset(
         {
-            "service_running", "svcdiff_only", "service_binary_in_user_path",
+            "service_running", "svcdiff_hidden", "service_binary_in_user_path",
             "service_no_binary", "service_host_injected", "service_host_hidden",
         }
     ),
@@ -594,7 +705,7 @@ SIGNAL_SOURCE: dict[str, str] = {
     "no_disk_path": "windows.modules.Modules",
     # Service.
     "service_running": "windows.svcscan.SvcScan",
-    "svcdiff_only": "windows.malware.svcdiff.SvcDiff",
+    "svcdiff_hidden": "windows.malware.svcdiff.SvcDiff",
     "service_binary_in_user_path": "windows.svcscan.SvcScan",
     "service_no_binary": "windows.svcscan.SvcScan",
     "service_host_injected": "windows.malware.malfind.Malfind",
@@ -789,13 +900,20 @@ def compute_service_signals(service: Service, analysis: Analysis) -> None:
         if str(row.get("State", "")).upper() == "SERVICE_RUNNING":
             signals.add("service_running")
 
-    # SvcDiff walks the registry rather than the in-memory service record, so a
-    # service it finds that SvcScan does not is one hidden from the service
-    # control manager's own list.
-    if service.rows("windows.malware.svcdiff.SvcDiff") and not service.rows(
-        "windows.svcscan.SvcScan"
-    ):
-        signals.add("svcdiff_only")
+    # Every SvcDiff row is already the finding. Upstream compares
+    # SvcScan.service_scan() against SvcList.service_list() and yields only
+    # `from_scan - from_list` — services recovered by pool scan that the service
+    # manager's own list does not admit to.
+    #
+    # So a SvcDiff hit is by construction *also* a SvcScan hit, and an earlier
+    # version of this that required "in SvcDiff and not in SvcScan" could never
+    # fire. Presence is the whole condition.
+    #
+    # Caveat worth knowing: SvcDiff only runs on Windows 10 15063+ 64-bit. On
+    # anything older it logs a warning and yields nothing, which is
+    # indistinguishable here from "no hidden services".
+    if service.rows("windows.malware.svcdiff.SvcDiff"):
+        signals.add("svcdiff_hidden")
 
     if service.rows("windows.svcscan.SvcScan") and not _present(service.binary):
         signals.add("service_no_binary")

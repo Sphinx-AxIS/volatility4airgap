@@ -30,6 +30,15 @@
   {
     "Base": 18446735277616529408,
     "File output": "Disabled",
+    "Name": "Wdf01000.sys",
+    "Offset": 2684366848,
+    "Path": "\\SystemRoot\\System32\\drivers\\Wdf01000.sys",
+    "Size": 1048576,
+    "__children": []
+  },
+  {
+    "Base": 18446735277616529408,
+    "File output": "Disabled",
     "Name": "evilrk.sys",
     "Offset": 2684391424,
     "Path": "",

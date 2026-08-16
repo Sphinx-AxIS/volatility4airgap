@@ -480,10 +480,33 @@ class TestAnalyzeCommand:
     def test_no_hash_skips_the_image_check(self, sample, image, capsys) -> None:
         """It still fails, but on the engine rather than the digest."""
         code = main(["analyze", str(sample), "--image", str(image), "--no-hash",
-                     "--engine", "exe"])
+                     "--no-pagefile", "--engine", "exe"])
 
         assert code == 2
         assert "volatility3.exe" in capsys.readouterr().err
+
+    def test_a_missing_pagefile_stops_the_follow_up(
+        self, sample, image, capsys
+    ) -> None:
+        """Triage used a swap layer; a follow-up without it reads less memory.
+
+        The evidence collected would then be narrower than the findings that
+        asked for it, with nothing in the output to say so.
+        """
+        code = main(["analyze", str(sample), "--image", str(image), "--no-hash"])
+        err = capsys.readouterr().err
+
+        assert code == 5
+        assert "the follow-up must use the same one(s)" in err
+        assert "--no-pagefile" in err
+
+    def test_no_pagefile_says_what_it_gives_up(self, sample, image, capsys) -> None:
+        main(["analyze", str(sample), "--image", str(image), "--no-hash",
+              "--no-pagefile", "--engine", "exe"])
+        err = capsys.readouterr().err
+
+        assert "ignoring the 1 pagefile(s)" in err
+        assert "Paged-out evidence" in err
 
     def test_the_analysis_manifest_binds_to_the_triage_run(self, sample) -> None:
         import json
@@ -547,6 +570,106 @@ class TestAnalyzeCommand:
         assert "that is a module signal" in capsys.readouterr().err
 
 
+class TestAnalyzeInputVerification:
+    """Fail closed on plugin output that no longer matches the run manifest."""
+
+    @pytest.fixture
+    def sample(self, tmp_path):
+        import shutil
+        from pathlib import Path as P
+
+        destination = tmp_path / "memory"
+        shutil.copytree(P(__file__).parent / "fixtures" / "triage-sample", destination)
+        return destination
+
+    def test_a_clean_folder_reports_verification(self, sample, capsys) -> None:
+        main(["analyze", str(sample)])
+        assert "Verified 20 plugin output(s)" in capsys.readouterr().out
+
+    def test_modified_input_is_refused(self, sample, capsys) -> None:
+        import json as j
+
+        path = sample / "windows.malware.malfind.Malfind.json"
+        rows = j.loads(path.read_text())
+        rows.pop()
+        path.write_text(j.dumps(rows))
+
+        code = main(["analyze", str(sample)])
+        err = capsys.readouterr().err
+
+        assert code == 6
+        assert "does not match its digest" in err
+        assert "--allow-modified-input" in err
+        assert not (sample / "findings").exists(), "must not write findings"
+
+    def test_the_override_proceeds_and_is_recorded(self, sample, capsys) -> None:
+        import json as j
+
+        path = sample / "windows.malware.malfind.Malfind.json"
+        path.write_text(j.dumps(j.loads(path.read_text())[:1]))
+
+        code = main(["analyze", str(sample), "--allow-modified-input"])
+        document = j.loads((sample / "analysis-manifest.json").read_text())
+
+        assert code == 0
+        assert "proceeding with modified input" in capsys.readouterr().err
+        assert document["triage_run"]["inputs"]["modified"] == [
+            "windows.malware.malfind.Malfind.json"
+        ]
+
+    def test_a_folder_with_no_manifest_warns_but_runs(self, sample, capsys) -> None:
+        (sample / "run-manifest.json").unlink()
+        code = main(["analyze", str(sample)])
+
+        assert code == 0
+        assert "cannot be verified" in capsys.readouterr().err
+
+    def test_the_manifest_records_the_verification(self, sample) -> None:
+        import json as j
+
+        main(["analyze", str(sample)])
+        document = j.loads((sample / "analysis-manifest.json").read_text())
+
+        assert document["triage_run"]["inputs"]["verified"] == 20
+        assert document["triage_run"]["inputs"]["modified"] == []
+
+
+class TestAnalyzeArgumentValidation:
+    @pytest.fixture
+    def sample(self, tmp_path):
+        import shutil
+        from pathlib import Path as P
+
+        destination = tmp_path / "memory"
+        shutil.copytree(P(__file__).parent / "fixtures" / "triage-sample", destination)
+        return destination
+
+    def test_a_negative_cap_is_an_error_not_a_silent_slice(
+        self, sample, capsys
+    ) -> None:
+        """--max-followups -1 would otherwise drop the least severe entity."""
+        code = main(["analyze", str(sample), "--max-followups", "-1"])
+
+        assert code == 2
+        assert "must be at least 1" in capsys.readouterr().err
+
+    def test_zero_is_an_error_too(self, sample, capsys) -> None:
+        assert main(["analyze", str(sample), "--max-followups", "0"]) == 2
+
+    def test_a_malformed_jobs_value_exits_cleanly(self, sample, capsys) -> None:
+        """Not a traceback: triage already handles this, and analyze must too."""
+        code = main(["analyze", str(sample), "--jobs", "banana"])
+
+        assert code == 2
+        assert "error:" in capsys.readouterr().err
+
+    def test_a_zero_jobs_value_exits_cleanly(self, sample, capsys) -> None:
+        code = main(["analyze", str(sample), "--jobs", "0"])
+
+        assert code == 2
+        assert "at least 1" in capsys.readouterr().err
+
+
 class TestTriageFollowUp:
     def test_the_flag_exists_and_defaults_off(self) -> None:
         from app.__main__ import build_parser
@@ -568,3 +691,39 @@ class TestTriageFollowUp:
 
         source = inspect.getsource(cli.cmd_triage)
         assert "cmd_analyze(" in source
+
+    def test_it_carries_the_pagefiles_through(self) -> None:
+        """triage --pagefile ... --follow-up must not silently drop the swap
+        layer: the follow-up would then read less memory than the triage that
+        produced the findings."""
+        import inspect
+
+        from app import __main__ as cli
+
+        source = inspect.getsource(cli.cmd_triage)
+        chain = source[source.index("cmd_analyze"):]
+        assert "pagefile" in source[source.index("analyze_args"):]
+        assert chain
+
+    def test_every_analyze_argument_is_supplied_by_the_chain(self) -> None:
+        """A new analyze flag must be added to the Namespace triage builds, or
+        cmd_analyze raises AttributeError only when --follow-up is used."""
+        from app.__main__ import build_parser
+
+        analyze = [
+            a for a in build_parser()._actions if getattr(a, "dest", None) == "command"
+        ][0].choices["analyze"]
+        expected = {
+            a.dest for a in analyze._actions if a.dest not in ("help", "func")
+        }
+
+        import inspect
+
+        from app import __main__ as cli
+
+        source = inspect.getsource(cli.cmd_triage)
+        block = source[source.index("analyze_args = argparse.Namespace("):]
+        block = block[: block.index("cmd_analyze(")]
+        missing = sorted(d for d in expected if f"{d}=" not in block)
+
+        assert not missing, f"triage --follow-up does not supply: {missing}"
