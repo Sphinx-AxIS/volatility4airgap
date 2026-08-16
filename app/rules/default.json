@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "name": "default",
+  "version": "2026-08-15",
+  "note": "Eight rules chosen for confidence rather than coverage. A rule that fires on a busy but healthy host teaches the analyst to ignore its whole category, so a signal earns a place here only when it is rare in normal operation or is qualified by a second, independent one.",
+  "rules": [
+    {
+      "id": "PROC-INJECT-NET",
+      "severity": "critical",
+      "title": "Injected process has external network activity",
+      "note": "A malfind region alone is common enough to be noise. The same region in a process talking to a routable address is the shape of a live implant.",
+      "all": [
+        { "signal": "malfind" },
+        { "signal": "network_external" }
+      ],
+      "actions": ["inspect_vads", "inspect_threads", "inspect_modules", "inspect_context"]
+    },
+    {
+      "id": "PROC-THREAD-INJECT",
+      "severity": "critical",
+      "title": "Suspicious thread executing in unbacked memory",
+      "note": "A thread whose start address lies outside any mapped module, in a process that also has executable private memory, is code that was written and then run.",
+      "all": [
+        { "signal": "malfind" },
+        { "signal": "suspicious_thread" }
+      ],
+      "actions": ["inspect_vads", "inspect_threads", "inspect_context"]
+    },
+    {
+      "id": "PROC-HIDDEN",
+      "severity": "high",
+      "title": "Running process absent from the active process list",
+      "note": "Recovered by pool scan, missing from the linked list, and carrying no exit time. The exit-time clause is what separates this from every process that has simply terminated.",
+      "signal": "psscan_only",
+      "actions": ["inspect_context", "inspect_modules", "inspect_vads"]
+    },
+    {
+      "id": "PROC-HOLLOW",
+      "severity": "high",
+      "title": "Possible process hollowing",
+      "note": "The mapped image does not match the file it claims to come from.",
+      "signal": "hollow",
+      "actions": ["inspect_vads", "inspect_modules", "inspect_context"]
+    },
+    {
+      "id": "PROC-GHOST",
+      "severity": "high",
+      "title": "Possible process ghosting",
+      "note": "The image file was marked for deletion before the section was mapped, so there is no file on disk to examine. The memory is the only copy.",
+      "signal": "ghosted",
+      "actions": ["inspect_vads", "inspect_context"]
+    },
+    {
+      "id": "PROC-XVIEW",
+      "severity": "high",
+      "title": "Process visible to one enumeration method but not another",
+      "note": "Cross-view discrepancy reported by PsXView. Kept alongside PROC-HIDDEN deliberately: the two derive the same conclusion by different routes, and disagreement between them is itself worth reading.",
+      "signal": "psxview_hidden",
+      "actions": ["inspect_context", "inspect_modules"]
+    },
+    {
+      "id": "PROC-MULTI-SIGNAL",
+      "severity": "high",
+      "title": "Several independent anomalies on one process",
+      "note": "No single signal here is conclusive. Three at once on the same process is not a coincidence worth explaining away.",
+      "at_least": {
+        "count": 3,
+        "of": [
+          { "signal": "malfind" },
+          { "signal": "suspicious_thread" },
+          { "signal": "network_external" },
+          { "signal": "unusual_parent" },
+          { "signal": "ldrmodules_unlinked" },
+          { "signal": "peb_masquerade" }
+        ]
+      },
+      "actions": ["inspect_vads", "inspect_modules", "inspect_context"]
+    },
+    {
+      "id": "PROC-INJECT",
+      "severity": "medium",
+      "title": "Executable memory not backed by a file",
+      "note": "Malfind on its own. Every JIT compiler on the host produces this, so it is listed for completeness rather than escalated. The higher-severity rules above are the ones that qualify it.",
+      "all": [
+        { "signal": "malfind" },
+        { "none": [{ "signal": "network_external" }, { "signal": "suspicious_thread" }] }
+      ],
+      "actions": ["inspect_vads"]
+    }
+  ]
+}

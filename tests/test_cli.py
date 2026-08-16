@@ -377,3 +377,131 @@ class TestCheckCommand:
         monkeypatch.setattr(cli, "BUNDLE_ROOT", tmp_path)
         assert main(["check"]) == 2
         assert "not a built bundle" in capsys.readouterr().err
+
+
+class TestAnalyzeCommand:
+    """The post-triage phase, driven end to end through the CLI."""
+
+    @pytest.fixture
+    def sample(self, tmp_path):
+        import shutil
+        from pathlib import Path
+
+        destination = tmp_path / "memory"
+        shutil.copytree(
+            Path(__file__).parent / "fixtures" / "triage-sample", destination
+        )
+        return destination
+
+    def test_writes_findings_and_next_steps(self, sample, capsys) -> None:
+        assert main(["analyze", str(sample)]) == 0
+
+        assert (sample / "findings" / "findings.json").is_file()
+        assert (sample / "findings" / "findings.csv").is_file()
+        assert (sample / "findings" / "next-steps.json").is_file()
+        assert (sample / "analysis-manifest.json").is_file()
+
+    def test_reports_findings_most_severe_first(self, sample, capsys) -> None:
+        main(["analyze", str(sample)])
+        out = capsys.readouterr().out
+
+        assert out.index("critical") < out.index("medium")
+        assert "PROC-0001" in out
+
+    def test_runs_no_volatility_without_an_image(self, sample, capsys) -> None:
+        """The whole point of the separate command: no image, no engine."""
+        main(["analyze", str(sample)])
+        out = capsys.readouterr().out
+
+        assert "planned but not run" in out
+        assert "--image" in out
+        assert not (sample / "followup").exists()
+
+    def test_a_missing_directory_exits_two(self, tmp_path, capsys) -> None:
+        code = main(["analyze", str(tmp_path / "absent")])
+
+        assert code == 2
+        assert "not a directory" in capsys.readouterr().err
+
+    def test_a_csv_only_folder_says_how_to_fix_it(self, tmp_path, capsys) -> None:
+        (tmp_path / "windows.pslist.PsList.csv").write_text("PID\n4\n")
+        code = main(["analyze", str(tmp_path)])
+
+        assert code == 1
+        assert "--format csv,json" in capsys.readouterr().err
+
+    def test_validate_rules_accepts_the_shipped_pack(self, sample, capsys) -> None:
+        assert main(["analyze", str(sample), "--validate-rules"]) == 0
+        assert "no problems found" in capsys.readouterr().out
+
+    def test_validate_rules_reports_a_bad_pack(self, sample, tmp_path, capsys) -> None:
+        import json
+
+        pack = tmp_path / "bad.json"
+        pack.write_text(json.dumps({
+            "schema_version": 1,
+            "rules": [{"id": "X", "severity": "high", "title": "t",
+                       "signal": "malfound"}],
+        }))
+        code = main(["analyze", str(sample), "--rules", str(pack),
+                     "--validate-rules"])
+
+        assert code == 2
+        assert 'did you mean "malfind"' in capsys.readouterr().err
+
+    def test_a_local_pack_overrides_the_bundled_one(self, sample, capsys) -> None:
+        import json
+
+        (sample / "rules.json").write_text(json.dumps({
+            "schema_version": 1, "name": "local", "version": "1",
+            "rules": [{"id": "LOCAL-1", "severity": "high", "title": "Local rule",
+                       "signal": "hollow", "actions": ["inspect_vads"]}],
+        }))
+        main(["analyze", str(sample)])
+        out = capsys.readouterr().out
+
+        assert "not the bundled pack" in out
+        assert "Local rule" in out
+
+    def test_the_max_followups_cap_is_reported(self, sample, capsys) -> None:
+        main(["analyze", str(sample), "--max-followups", "1"])
+        out = capsys.readouterr().out
+
+        assert "--max-followups" in out
+
+    def test_a_mismatched_image_is_refused(self, sample, image, capsys) -> None:
+        """Following up against a different capture files evidence under a PID
+        that means something else there."""
+        code = main(["analyze", str(sample), "--image", str(image)])
+
+        assert code == 5
+        assert "sha256 mismatch" in capsys.readouterr().err
+
+    def test_no_hash_skips_the_image_check(self, sample, image, capsys) -> None:
+        """It still fails, but on the engine rather than the digest."""
+        code = main(["analyze", str(sample), "--image", str(image), "--no-hash",
+                     "--engine", "exe"])
+
+        assert code == 2
+        assert "volatility3.exe" in capsys.readouterr().err
+
+    def test_the_analysis_manifest_binds_to_the_triage_run(self, sample) -> None:
+        import json
+
+        from app import manifest
+
+        main(["analyze", str(sample)])
+        document = json.loads((sample / manifest.ANALYSIS_FILENAME).read_text())
+
+        expected = manifest.sha256_file(sample / manifest.FILENAME)
+        assert document["triage_run"]["sha256"] == expected
+        assert document["rule_pack"]["sha256"]
+
+    def test_the_run_manifest_is_left_alone(self, sample) -> None:
+        """Analysis derives; it does not rewrite what triage attested to."""
+        from app import manifest
+
+        before = manifest.sha256_file(sample / manifest.FILENAME)
+        main(["analyze", str(sample)])
+
+        assert manifest.sha256_file(sample / manifest.FILENAME) == before

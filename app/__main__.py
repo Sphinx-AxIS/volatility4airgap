@@ -363,6 +363,202 @@ def cmd_triage(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _resolve_rule_pack(args: argparse.Namespace, output_dir: Path) -> Path:
+    """Explicit pack, then a local override beside the outputs, then the bundled one."""
+    from . import rules as rules_mod
+
+    if args.rules:
+        return Path(args.rules).expanduser()
+    local = output_dir / "rules.json"
+    return local if local.is_file() else rules_mod.DEFAULT_PACK
+
+
+def cmd_analyze(args: argparse.Namespace) -> int:
+    """Correlate a finished triage run into findings, and collect what they imply."""
+    from . import (
+        analysis as analysis_mod,
+        engine as engine_mod,
+        followup as followup_mod,
+        manifest,
+        rules as rules_mod,
+        scheduler,
+    )
+
+    output_dir = Path(args.output_dir).expanduser()
+    if not output_dir.is_dir():
+        print(f"error: not a directory: {output_dir}", file=sys.stderr)
+        return 2
+
+    pack_path = _resolve_rule_pack(args, output_dir)
+    try:
+        pack = rules_mod.load(pack_path, known_actions=set(followup_mod.ACTIONS))
+    except rules_mod.RulePackError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if args.validate_rules:
+        print(f"{pack_path}\n  {len(pack.rules)} rule(s), no problems found.")
+        return 0
+
+    if pack_path != rules_mod.DEFAULT_PACK:
+        print(f"Using rules from {pack_path} (sha256 {pack.sha256[:12]}), "
+              "not the bundled pack.")
+        print("Findings will record this.")
+
+    started = manifest.utc_now()
+    result = analysis_mod.analyse(output_dir)
+
+    for notice in result.notices:
+        prefix = "error: " if notice.level == "error" else "warning: "
+        print(f"\n{prefix}{notice.message}", file=sys.stderr)
+    if any(n.level == "error" for n in result.notices):
+        return 1
+
+    findings = rules_mod.evaluate(pack, result)
+    findings_dir = output_dir / "findings"
+    json_path, csv_path = rules_mod.write(findings_dir, pack, result, findings)
+
+    summary = rules_mod.summarise(findings)
+    print(f"\n{len(result.processes)} process(es) examined, "
+          f"{sum(result.plugins_read.values())} rows across "
+          f"{len(result.plugins_read)} plugin(s).")
+
+    if not findings:
+        skipped = len(result.plugins_missing)
+        print(f"No rules matched. {len(result.plugins_read)} plugin(s) evaluated, "
+              f"{skipped} unavailable.")
+    else:
+        print(f"\n{summary['total']} finding(s): "
+              + ", ".join(f"{summary[s]} {s}" for s in rules_mod.SEVERITIES if summary[s]))
+        for finding in findings:
+            print(f"  {finding.finding_id}  {finding.severity:8s} "
+                  f"{finding.process.label:34s} {finding.title}")
+
+    blocked = rules_mod.not_evaluated(pack, result)
+    for rule_id, reason in sorted(blocked.items()):
+        print(f"  not evaluated: {rule_id} ({reason})")
+
+    plan = followup_mod.plan(
+        findings, max_followups=args.max_followups, allow_dump=args.dump
+    )
+
+    executed = 0
+    if plan.pending and args.image:
+        image = Path(args.image).expanduser()
+        if not image.is_file():
+            print(f"error: image not found: {image}", file=sys.stderr)
+            return 2
+
+        if not args.no_hash and not _image_matches(output_dir, image):
+            return 5
+
+        try:
+            engine = engine_mod.select(args.engine, BUNDLE_ROOT)
+        except (engine_mod.EngineUnavailable, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+        symbols_dir = (
+            Path(args.symbols).expanduser() if args.symbols else default_symbols_dir()
+        )
+        tasks = followup_mod.build_tasks(
+            plan,
+            image=image,
+            output_dir=output_dir,
+            engine=engine,
+            symbols_dir=symbols_dir,
+            cache_dir=BUNDLE_ROOT / "cache",
+        )
+
+        print(f"\nRunning {len(tasks)} follow-up task(s)...")
+        done = {"n": 0}
+
+        def on_finish(task_result: scheduler.TaskResult) -> None:
+            done["n"] += 1
+            mark = "ok  " if task_result.ok else "FAIL"
+            print(f"  [{done['n']:>3}/{len(tasks)}] {mark} {task_result.task.label} "
+                  f"({task_result.duration:.1f}s)")
+
+        results = scheduler.run_tasks(
+            tasks, jobs=scheduler.resolve_jobs(args.jobs), timeout=args.timeout,
+            on_finish=on_finish,
+        )
+        followup_mod.record_results(plan, results)
+        executed = sum(1 for r in results if r.ok)
+    elif plan.pending:
+        print(f"\n{len(plan.pending)} follow-up task(s) planned but not run.")
+        print(f"  Execute with: v4ag analyze {output_dir} --image <image>")
+
+    steps_path = followup_mod.write(findings_dir, plan)
+    for notice in plan.notices:
+        print(f"\n{notice}")
+
+    manifest.write(
+        output_dir,
+        manifest.build_analysis(
+            output_dir=output_dir,
+            rule_pack={
+                "name": pack.name,
+                "version": pack.version,
+                "path": str(pack.path),
+                "sha256": pack.sha256,
+            },
+            findings_summary=summary,
+            not_evaluated=blocked,
+            plugins_missing=result.plugins_missing,
+            followups_executed=executed,
+            started_utc=started,
+        ),
+        filename=manifest.ANALYSIS_FILENAME,
+    )
+
+    print(f"\nFindings  {json_path}")
+    print(f"          {csv_path}")
+    print(f"Next steps {steps_path}")
+    print(f"Manifest  {output_dir / manifest.ANALYSIS_FILENAME}")
+    return 0
+
+
+def _image_matches(output_dir: Path, image: Path) -> bool:
+    """Refuse to gather evidence from an image the findings do not describe.
+
+    A follow-up run against a different capture would produce output filed under
+    a PID that means something else there, which is worse than no output at all.
+    """
+    import json
+
+    from . import manifest
+
+    triage_manifest = output_dir / manifest.FILENAME
+    if not triage_manifest.is_file():
+        print(f"\nwarning: no {manifest.FILENAME} here, so the image cannot be "
+              "checked against the findings.", file=sys.stderr)
+        return True
+
+    try:
+        recorded = json.loads(triage_manifest.read_text(encoding="utf-8"))
+        expected = (recorded.get("image") or {}).get("sha256")
+    except (OSError, ValueError):
+        expected = None
+
+    if not expected:
+        print("\nwarning: the triage run recorded no image digest (--no-hash?), "
+              "so the image cannot be checked.", file=sys.stderr)
+        return True
+
+    print(f"\nVerifying {image.name} against the triage manifest...")
+    actual = manifest.sha256_file(image)
+    if actual == expected:
+        return True
+
+    print("\nerror: this image is not the one triaged (sha256 mismatch).",
+          file=sys.stderr)
+    print(f"  manifest {expected}\n  supplied {actual}", file=sys.stderr)
+    print("  Findings reference a different capture. Skip this check with "
+          "--no-hash if that is intended.", file=sys.stderr)
+    return False
+
+
 def cmd_fetch_symbols(args: argparse.Namespace) -> int:
     """Download and convert the symbols a request asks for. Internet side."""
     from . import fetch
@@ -650,7 +846,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 #: Listed by doctor so a stale extract is obvious at a glance.
-_COMMANDS = ("triage", "symbols", "fetch-symbols", "verify", "doctor", "check")
+_COMMANDS = (
+    "triage", "analyze", "symbols", "fetch-symbols", "verify", "doctor", "check"
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -699,6 +897,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="run even if symbols are missing or the probe fails",
     )
     triage_cmd.set_defaults(func=cmd_triage)
+
+    analyze = sub.add_parser(
+        "analyze",
+        help="correlate a finished triage run into findings",
+        description=(
+            "Reads the JSON a triage run wrote, correlates it into one record per "
+            "process, and applies a rule pack. Needs no memory image unless "
+            "--image is given to collect the follow-up evidence as well."
+        ),
+    )
+    analyze.add_argument("output_dir", help="a triage output directory")
+    analyze.add_argument(
+        "--image", default=None,
+        help="the image that was triaged; supply it to run the follow-ups too",
+    )
+    analyze.add_argument(
+        "--rules", default=None,
+        help="rule pack to use (default: rules.json here, else the bundled pack)",
+    )
+    analyze.add_argument(
+        "--validate-rules", action="store_true",
+        help="check the rule pack and exit without analysing",
+    )
+    analyze.add_argument(
+        "--max-followups", type=int, default=10, metavar="N",
+        help="entities to follow up, most severe first (default: 10)",
+    )
+    analyze.add_argument(
+        "--dump", action="store_true",
+        help="also execute dump actions; endpoint protection may quarantine the results",
+    )
+    analyze.add_argument("--symbols", default=None, help="symbols directory")
+    analyze.add_argument(
+        "--jobs", default="1", help="follow-ups to run concurrently, or 'auto'"
+    )
+    analyze.add_argument(
+        "--engine", default="auto", choices=["auto", "library", "exe"],
+        help="which Volatility to drive (default: auto)",
+    )
+    analyze.add_argument(
+        "--timeout", type=float, default=3600.0, help="per-task timeout in seconds"
+    )
+    analyze.add_argument(
+        "--no-hash", action="store_true",
+        help="skip checking the image against the triage manifest",
+    )
+    analyze.set_defaults(func=cmd_analyze)
 
     symbols = sub.add_parser(
         "symbols", help="identify the kernel and report the symbols needed"

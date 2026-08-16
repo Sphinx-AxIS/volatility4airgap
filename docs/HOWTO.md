@@ -128,6 +128,46 @@ The main command.
 | `--force` | off | Run even if symbols are missing or the probe fails |
 | `--output PATH` | cwd | Where to write `symbol_request.json` if symbols are missing |
 
+### `analyze` — turn a finished run into findings
+
+Reads the JSON `triage` wrote, correlates it into one record per process, and applies a
+rule pack. Give it a triage output folder, not an image:
+
+```bat
+v4ag.bat analyze output\WS01
+```
+
+That needs no memory image, so it can be run against an archived output folder — on a
+different machine, days later, as often as you like. Add `--image` and it also runs the
+follow-up Volatility commands the findings imply, filed under `followup\PID-<n>\`.
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `output_dir` | *required* | A triage output directory |
+| `--image PATH` | none | The image that was triaged. Supply it to run the follow-ups too |
+| `--rules PATH` | bundled pack | Rule pack to apply |
+| `--validate-rules` | off | Check a rule pack and exit without analysing |
+| `--max-followups N` | `10` | Entities to follow up, most severe first |
+| `--dump` | off | Also execute dump actions (see the warning below) |
+| `--jobs N` | `1` | Follow-ups to run concurrently. `auto` picks 1–4 |
+| `--engine NAME` | `auto` | `library`, `exe`, or `auto` |
+| `--symbols DIR` | `symbols\` | Where to look for ISF symbol files |
+| `--timeout SECONDS` | `3600` | Per-task limit before the process is killed |
+| `--no-hash` | off | Skip checking the image against the triage manifest |
+
+The image is checked against the SHA-256 in `run-manifest.json` before any follow-up
+runs. A mismatch stops the run: the findings describe a different capture, so PID 4180
+there means something else here.
+
+**On `--dump`.** Dump actions write process executables and VAD contents to disk. Two
+consequences on a live workstation: a dumped malicious PE will very likely be
+quarantined by endpoint protection while the run is in progress, and VAD dumps of a
+large process run to gigabytes. Dumps are therefore planned and recorded in
+`next-steps.json` but not executed unless you ask.
+
+A rule pack named `rules.json` sitting in the output folder is used in preference to the
+bundled one, which is reported at the top of the run and recorded in every finding.
+
 ### `symbols` — report what symbols the image needs
 
 Use when you want the symbol answer without starting a run.
@@ -288,6 +328,29 @@ output\<image name>\
    └─ ...
 ```
 
+After `analyze`, the same folder also holds:
+
+```
+output\<image name>\
+├─ analysis-manifest.json
+├─ findings\
+│  ├─ findings.json          the machine interface
+│  ├─ findings.csv           the same findings, for reading
+│  └─ next-steps.json        what was planned, and whether it ran
+└─ followup\
+   ├─ PID-4180\
+   └─ PID-7224\
+```
+
+`findings.json` records, for each finding, the rule that produced it, the digest of the
+rule pack in force, and the plugin rows that triggered it. It also lists the rules that
+could *not* be evaluated because a plugin they need failed during triage — so an empty
+findings list cannot be mistaken for a clean host.
+
+`analysis-manifest.json` is written beside `run-manifest.json` rather than replacing it,
+and records the triage manifest's SHA-256. That is what ties a set of findings to one
+specific triage run.
+
 CSV filenames match what CORE-Respond's `ingest_volatility.py` expects, so results can be
 fed into it unchanged.
 
@@ -312,6 +375,7 @@ diagnostic is lost. If a plugin you expected is absent from the output folder, c
 | `2` | Bad input | Fix the path or option named in the error |
 | `3` | Symbols missing | Run `fetch-symbols` on a connected machine |
 | `4` | Probe failed | Read the diagnosis; `--force` to run anyway |
+| `5` | `analyze --image` does not match the triage run | Supply the image that was triaged |
 
 Useful in a batch file:
 

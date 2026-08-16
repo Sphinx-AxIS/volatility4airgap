@@ -1,0 +1,69 @@
+
+[
+  {
+    "Args": "C:\\Windows\\System32\\System",
+    "PID": 4,
+    "Process": "System",
+    "__children": []
+  },
+  {
+    "Args": "C:\\Windows\\System32\\smss.exe",
+    "PID": 388,
+    "Process": "smss.exe",
+    "__children": []
+  },
+  {
+    "Args": "C:\\Windows\\System32\\csrss.exe",
+    "PID": 500,
+    "Process": "csrss.exe",
+    "__children": []
+  },
+  {
+    "Args": "C:\\Windows\\System32\\wininit.exe",
+    "PID": 560,
+    "Process": "wininit.exe",
+    "__children": []
+  },
+  {
+    "Args": "C:\\Windows\\System32\\services.exe",
+    "PID": 660,
+    "Process": "services.exe",
+    "__children": []
+  },
+  {
+    "Args": "C:\\Windows\\System32\\lsass.exe",
+    "PID": 700,
+    "Process": "lsass.exe",
+    "__children": []
+  },
+  {
+    "Args": "C:\\Windows\\System32\\svchost.exe",
+    "PID": 900,
+    "Process": "svchost.exe",
+    "__children": []
+  },
+  {
+    "Args": "C:\\Windows\\System32\\explorer.exe",
+    "PID": 2100,
+    "Process": "explorer.exe",
+    "__children": []
+  },
+  {
+    "Args": "C:\\Windows\\System32\\powershell.exe",
+    "PID": 4180,
+    "Process": "powershell.exe",
+    "__children": []
+  },
+  {
+    "Args": "C:\\Windows\\System32\\svchost.exe",
+    "PID": 5000,
+    "Process": "svchost.exe",
+    "__children": []
+  },
+  {
+    "Args": "C:\\Windows\\System32\\lsass.exe",
+    "PID": 6000,
+    "Process": "lsass.exe",
+    "__children": []
+  }
+]

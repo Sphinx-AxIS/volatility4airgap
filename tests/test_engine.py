@@ -154,3 +154,47 @@ class TestSwapLayers:
             tmp_path / "i", "p", "csv", swap_files=[tmp_path / "pagefile.sys"]
         )
         assert "--single-swap-locations" in argv
+
+
+class TestTargetedInvocation:
+    """Arguments for a follow-up run, and which side of the plugin they go on.
+
+    ``-o`` is a global Volatility option and must precede the plugin name.
+    ``--pid`` belongs to the plugin and must follow it. Getting either wrong
+    produces an argparse error that names neither the flag nor the cause.
+    """
+
+    def test_plugin_args_follow_the_plugin(self, lib, tmp_path) -> None:
+        argv = lib.command(
+            tmp_path / "i", "windows.vadinfo.VadInfo", "json",
+            plugin_args=["--pid", "4180"],
+        )
+        assert argv[-3:] == ["windows.vadinfo.VadInfo", "--pid", "4180"]
+
+    def test_nothing_follows_the_pid_list(self, lib, tmp_path) -> None:
+        """--pid is a ListRequirement (nargs='+'); a trailing token is eaten."""
+        argv = lib.command(
+            tmp_path / "i", "windows.dlllist.DllList", "json",
+            output_dir=tmp_path / "out",
+            swap_files=[tmp_path / "pagefile.sys"],
+            plugin_args=["--pid", "4180"],
+        )
+        assert argv[-1] == "4180"
+
+    def test_output_dir_precedes_the_plugin(self, lib, tmp_path) -> None:
+        argv = lib.command(
+            tmp_path / "i", "windows.pslist.PsList", "json", output_dir=tmp_path / "out"
+        )
+        assert argv[argv.index("-o") + 1] == str(tmp_path / "out")
+        assert argv.index("-o") < argv.index("windows.pslist.PsList")
+
+    def test_several_plugin_args(self, lib, tmp_path) -> None:
+        argv = lib.command(
+            tmp_path / "i", "p", "json", plugin_args=["--dump", "--pid", "4180", "7224"]
+        )
+        assert argv[-4:] == ["--dump", "--pid", "4180", "7224"]
+
+    def test_absent_by_default(self, lib, tmp_path) -> None:
+        argv = lib.command(tmp_path / "i", "windows.pslist.PsList", "json")
+        assert "-o" not in argv
+        assert argv[-1] == "windows.pslist.PsList"

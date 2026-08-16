@@ -49,7 +49,16 @@ class VolEngine(ABC):
         offline: bool = True,
         parallelism: str | None = "off",
         swap_files: list[Path] | None = None,
+        output_dir: Path | None = None,
+        plugin_args: list[str] | None = None,
     ) -> list[str]:
+        """Build the argv for one plugin invocation.
+
+        Two of these arguments sit on opposite sides of the plugin name, and the
+        split is not stylistic. ``-o`` is a *global* Volatility option, so it must
+        precede the plugin. ``plugin_args`` belong to the plugin and must follow
+        it. Swapping either produces an argparse error that names neither.
+        """
         if renderer not in RENDERERS:
             raise ValueError(f"unknown renderer {renderer!r}")
 
@@ -78,8 +87,21 @@ class VolEngine(ABC):
             # Volatility can fan out internally. Combined with --jobs that would
             # oversubscribe by a factor of the core count.
             argv += ["--parallelism", parallelism]
+        if output_dir is not None:
+            # Where --dump writes. Without it, dumped executables land in the
+            # working directory of whichever process the scheduler happened to
+            # start, which is not a place evidence should go.
+            argv += ["-o", str(output_dir)]
 
         argv.append(plugin)
+
+        # Plugin arguments come last, and nothing may follow them. ``--pid`` is a
+        # ListRequirement, so argparse gives it nargs='+' and it consumes every
+        # following token — the same hazard --single-swap-locations has above,
+        # avoided here by there being no later argument to swallow.
+        if plugin_args:
+            argv += [str(arg) for arg in plugin_args]
+
         return argv
 
 

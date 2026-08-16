@@ -17,6 +17,7 @@ from . import __version__
 
 SCHEMA_VERSION = 1
 FILENAME = "run-manifest.json"
+ANALYSIS_FILENAME = "analysis-manifest.json"
 
 
 def sha256_file(path: Path) -> str:
@@ -99,8 +100,69 @@ def build(
     }
 
 
-def write(output_dir: Path, document: dict) -> Path:
-    path = output_dir / FILENAME
+def write(output_dir: Path, document: dict, *, filename: str = FILENAME) -> Path:
+    path = output_dir / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
     return path
+
+
+def build_analysis(
+    *,
+    output_dir: Path,
+    rule_pack: dict,
+    findings_summary: dict,
+    not_evaluated: dict,
+    plugins_missing: dict,
+    followups_executed: int,
+    started_utc: str,
+) -> dict:
+    """The analysis manifest, written beside the run manifest rather than into it.
+
+    ``build`` above hashes every file under the output directory, so writing
+    ``findings/`` and ``followup/`` into that tree leaves ``run-manifest.json``
+    describing a directory that no longer exists as recorded. Rewriting it would
+    also lose the distinction between what triage collected and what analysis
+    derived. Referencing it by digest keeps both intact and makes the stronger
+    claim: these findings came from *that* run, provably.
+    """
+    triage_manifest = output_dir / FILENAME
+    derived = []
+    for sub in ("findings", "followup"):
+        root = output_dir / sub
+        if not root.is_dir():
+            continue
+        for path in sorted(p for p in root.rglob("*") if p.is_file()):
+            try:
+                derived.append(
+                    {
+                        "file": path.relative_to(output_dir).as_posix(),
+                        "size_bytes": path.stat().st_size,
+                        "sha256": sha256_file(path),
+                    }
+                )
+            except OSError:
+                continue
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "tool_version": __version__,
+        "started_utc": started_utc,
+        "finished_utc": utc_now(),
+        "host": {
+            "platform": platform.platform(),
+            "python": platform.python_version(),
+        },
+        "triage_run": {
+            "manifest": FILENAME,
+            "sha256": (
+                sha256_file(triage_manifest) if triage_manifest.is_file() else None
+            ),
+        },
+        "rule_pack": rule_pack,
+        "findings": findings_summary,
+        "rules_not_evaluated": not_evaluated,
+        "plugins_missing": plugins_missing,
+        "followup_tasks_executed": followups_executed,
+        "outputs": derived,
+    }
