@@ -253,8 +253,19 @@ class TestDoctor:
 class TestBuildIdentity:
     """A stale extract must be obvious rather than showing up as a missing command."""
 
-    def test_reports_source_checkout_without_a_manifest(self) -> None:
+    def test_reports_source_checkout_without_a_manifest(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The absence must be arranged, not assumed.
+
+        This read BUNDLE_ROOT as it stood, so it asserted "no manifest here" —
+        true of a source checkout and false the moment the checkout shares a
+        directory with an extracted bundle. Its sibling below already
+        monkeypatches BUNDLE_ROOT for the opposite case; this does the same.
+        """
         import app.__main__ as cli
+
+        monkeypatch.setattr(cli, "BUNDLE_ROOT", tmp_path / "no-bundle")
 
         assert cli.build_identity() == "source checkout"
 
@@ -477,7 +488,23 @@ class TestAnalyzeCommand:
         assert code == 5
         assert "sha256 mismatch" in capsys.readouterr().err
 
-    def test_no_hash_skips_the_image_check(self, sample, image, capsys) -> None:
+    @pytest.fixture
+    def no_exe_engine(self, tmp_path, monkeypatch):
+        """Make ``--engine exe`` deterministically unavailable.
+
+        Tests below use an unavailable engine as a controlled stopping point,
+        and used to rely on ``volatility3.exe`` merely not existing beside
+        ``app/``. That holds in a source checkout and fails in an extracted
+        bundle, where the same tests instead launched Volatility for real
+        against a fixture image and blocked for the whole one-hour follow-up
+        timeout. Pointing BUNDLE_ROOT at an empty directory makes the condition
+        explicit and independent of what happens to be on disk.
+        """
+        monkeypatch.setattr("app.__main__.BUNDLE_ROOT", tmp_path / "no-bundle")
+
+    def test_no_hash_skips_the_image_check(
+        self, sample, image, capsys, no_exe_engine
+    ) -> None:
         """It still fails, but on the engine rather than the digest."""
         code = main(["analyze", str(sample), "--image", str(image), "--no-hash",
                      "--no-pagefile", "--engine", "exe"])
@@ -500,7 +527,9 @@ class TestAnalyzeCommand:
         assert "the follow-up must use the same one(s)" in err
         assert "--no-pagefile" in err
 
-    def test_no_pagefile_says_what_it_gives_up(self, sample, image, capsys) -> None:
+    def test_no_pagefile_says_what_it_gives_up(
+        self, sample, image, capsys, no_exe_engine
+    ) -> None:
         main(["analyze", str(sample), "--image", str(image), "--no-hash",
               "--no-pagefile", "--engine", "exe"])
         err = capsys.readouterr().err
