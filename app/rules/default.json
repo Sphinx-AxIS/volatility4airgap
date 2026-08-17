@@ -2,7 +2,7 @@
   "schema_version": 1,
   "name": "default",
   "version": "2026-08-15",
-  "note": "Eight rules chosen for confidence rather than coverage. A rule that fires on a busy but healthy host teaches the analyst to ignore its whole category, so a signal earns a place here only when it is rare in normal operation or is qualified by a second, independent one.",
+  "note": "Rules chosen for confidence rather than coverage. A rule that fires on a busy but healthy host teaches the analyst to ignore its whole category, so a signal earns a place here only when it is rare in normal operation or is qualified by a second, independent one. Dump actions are recommended only where the evidence is strong enough to justify writing live malicious code to the examiner's workstation: the two critical injection rules, hollowing, and ghosting (where memory is the only copy). PROC-INJECT is deliberately excluded — a bare malfind region is why that rule is only medium, and suggesting a dump for each one would undo the distinction. Dumps are never executed unless --dump is given; the analyst is handed the command instead.",
   "rules": [
     {
       "id": "PROC-INJECT-NET",
@@ -13,7 +13,7 @@
         { "signal": "malfind" },
         { "signal": "network_external" }
       ],
-      "actions": ["inspect_vads", "inspect_threads", "inspect_modules", "inspect_context"]
+      "actions": ["inspect_vads", "inspect_threads", "inspect_modules", "inspect_context", "dump_vads", "dump_process"]
     },
     {
       "id": "PROC-THREAD-INJECT",
@@ -24,7 +24,7 @@
         { "signal": "malfind" },
         { "signal": "suspicious_thread" }
       ],
-      "actions": ["inspect_vads", "inspect_threads", "inspect_context"]
+      "actions": ["inspect_vads", "inspect_threads", "inspect_context", "dump_vads"]
     },
     {
       "id": "PROC-HIDDEN",
@@ -40,15 +40,15 @@
       "title": "Possible process hollowing",
       "note": "The mapped image does not match the file it claims to come from.",
       "signal": "hollow",
-      "actions": ["inspect_vads", "inspect_modules", "inspect_context"]
+      "actions": ["inspect_vads", "inspect_modules", "inspect_context", "dump_process"]
     },
     {
       "id": "PROC-GHOST",
       "severity": "high",
       "title": "Possible process ghosting",
-      "note": "The image file was marked for deletion before the section was mapped, so there is no file on disk to examine. The memory is the only copy.",
+      "note": "The image file was marked for deletion before the section was mapped, so there is no file on disk to examine. The memory is the only copy — which is why this rule suggests a dump even though it is only high.",
       "signal": "ghosted",
-      "actions": ["inspect_vads", "inspect_context"]
+      "actions": ["inspect_vads", "inspect_context", "dump_process"]
     },
     {
       "id": "PROC-XVIEW",

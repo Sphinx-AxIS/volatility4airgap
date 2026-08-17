@@ -518,8 +518,9 @@ CSV_COLUMNS = (
 
 
 def write(findings_dir: Path, pack: RulePack, analysis: Analysis,
-          findings: list[Finding]) -> tuple[Path, Path]:
-    """Write both files. JSON is the machine interface; CSV is for the analyst."""
+          findings: list[Finding], plan=None) -> tuple[Path, Path]:
+    """Write all three files. JSON is the machine interface; CSV and TXT are for
+    the analyst. ``plan``, when given, adds the suggested-command section."""
     findings_dir.mkdir(parents=True, exist_ok=True)
 
     json_path = findings_dir / "findings.json"
@@ -529,7 +530,7 @@ def write(findings_dir: Path, pack: RulePack, analysis: Analysis,
     )
 
     (findings_dir / "findings.txt").write_text(
-        report(pack, analysis, findings) + "\n", encoding="utf-8"
+        report(pack, analysis, findings, plan) + "\n", encoding="utf-8"
     )
 
     csv_path = findings_dir / "findings.csv"
@@ -554,12 +555,54 @@ def write(findings_dir: Path, pack: RulePack, analysis: Analysis,
     return json_path, csv_path
 
 
-def report(pack: RulePack, analysis: Analysis, findings: list[Finding]) -> str:
+def _suggested_block(plan) -> list[str]:
+    """The manual-collection section: what to run, and the command to run it.
+
+    A recommendation the analyst has to reconstruct from a plugin name and a PID
+    is a recommendation most people skip. The command is therefore given in full
+    and copy-pasteable, grouped by entity so it sits with the finding that asked
+    for it.
+    """
+    if plan is None or not plan.suggested:
+        return []
+
+    lines = [
+        "SUGGESTED — NOT RUN",
+        "-" * 72,
+        "These collect evidence the findings above call for, and were deliberately",
+        "not executed: each writes live malicious code to this workstation, where",
+        "endpoint protection may quarantine it mid-write. Run them when you are",
+        "ready, or re-run analyze with --dump.",
+        "",
+    ]
+
+    by_entity: dict[str, list] = {}
+    for task in plan.suggested:
+        by_entity.setdefault(task.entity_label, []).append(task)
+
+    for label, tasks in by_entity.items():
+        lines.append(f"{label}")
+        for task in tasks:
+            what = f"{task.action}"
+            if task.region:
+                what += f"  region {task.region}"
+            lines.append(f"    {what}  ->  {task.directory}/")
+            if task.suggested_command:
+                lines.append(f"      {task.suggested_command}")
+        lines.append("")
+    return lines
+
+
+def report(pack: RulePack, analysis: Analysis, findings: list[Finding],
+           plan=None) -> str:
     """A findings summary meant to be read rather than parsed.
 
     findings.csv is a table; this is the paragraph an examiner writes at the top
     of a report. It groups by entity rather than by rule, because the question
     being asked is "what should I look at" and not "which rules fired".
+
+    ``plan`` is optional so the report can still be produced before follow-ups
+    are planned; when given, its suggested commands are appended.
     """
     lines = [
         "FINDINGS",
@@ -603,6 +646,8 @@ def report(pack: RulePack, analysis: Analysis, findings: list[Finding]) -> str:
         if actions:
             lines.append(f"    next: {', '.join(actions)}")
         lines.append("")
+
+    lines.extend(_suggested_block(plan))
 
     blocked = not_evaluated(pack, analysis)
     if blocked:

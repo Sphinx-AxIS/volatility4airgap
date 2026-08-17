@@ -562,7 +562,6 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
     findings = rules_mod.evaluate(pack, result)
     findings_dir = output_dir / "findings"
-    json_path, csv_path = rules_mod.write(findings_dir, pack, result, findings)
 
     summary = rules_mod.summarise(findings)
     print(f"\n{len(result.processes)} process(es), {len(result.modules)} module(s) "
@@ -589,6 +588,25 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         findings, max_followups=args.max_followups, allow_dump=args.dump
     )
 
+    # Selected once, before the image branch: build_tasks needs it to run
+    # follow-ups, and render_suggestions needs it to write the commands an
+    # analyst runs by hand — which must be produced by the same builder, or the
+    # two drift. Only fatal when an image was given and something must actually
+    # run; otherwise suggestions degrade to a note and the rest still works.
+    # Failure is not raised here: the diagnostics below (pagefile handling, the
+    # image digest check) must still be reported in order, and an unavailable
+    # engine only actually blocks the point where something has to run.
+    engine = None
+    engine_error = None
+    try:
+        engine = engine_mod.select(args.engine, BUNDLE_ROOT)
+    except (engine_mod.EngineUnavailable, ValueError) as exc:
+        engine_error = str(exc)
+
+    symbols_dir = (
+        Path(args.symbols).expanduser() if args.symbols else default_symbols_dir()
+    )
+
     executed = 0
     followup_pagefiles: list[Path] = []
     if plan.pending and args.image:
@@ -612,15 +630,10 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             if not ok:
                 return 5
 
-        try:
-            engine = engine_mod.select(args.engine, BUNDLE_ROOT)
-        except (engine_mod.EngineUnavailable, ValueError) as exc:
-            print(f"error: {exc}", file=sys.stderr)
+        if engine is None:
+            print(f"error: {engine_error}", file=sys.stderr)
             return 2
 
-        symbols_dir = (
-            Path(args.symbols).expanduser() if args.symbols else default_symbols_dir()
-        )
         tasks = followup_mod.build_tasks(
             plan,
             image=image,
@@ -650,6 +663,26 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         print(f"\n{len(plan.pending)} follow-up task(s) planned but not run.")
         print(f"  Execute with: v4ag analyze {output_dir} --image <image>")
 
+    # Render the manual-collection commands, then write the findings — findings.txt
+    # carries them, so it must be written after the plan exists rather than before.
+    if plan.suggested:
+        if engine is not None:
+            followup_mod.render_suggestions(
+                plan,
+                output_dir=output_dir,
+                engine=engine,
+                symbols_dir=symbols_dir,
+                cache_dir=BUNDLE_ROOT / "cache",
+                image=Path(args.image).expanduser() if args.image else None,
+                pagefiles=followup_pagefiles or None,
+            )
+        else:
+            plan.notices.append(
+                "Suggested dumps could not be written as commands: "
+                f"{engine_error}"
+            )
+
+    json_path, csv_path = rules_mod.write(findings_dir, pack, result, findings, plan)
     steps_path = followup_mod.write(findings_dir, plan)
     for notice in plan.notices:
         print(f"\n{notice}")

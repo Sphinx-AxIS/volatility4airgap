@@ -16,8 +16,15 @@ from app import analysis, engine as engine_mod, followup, rules
 
 
 def finding(pid: int, *, severity: str = "high", actions=("inspect_vads",),
-            rule_id: str = "R-1", offset: int | None = None) -> rules.Finding:
+            rule_id: str = "R-1", offset: int | None = None,
+            regions: tuple[int, ...] = ()) -> rules.Finding:
     process = analysis.Process(pid=pid, offset=offset, name=f"p{pid}.exe")
+    if regions:
+        # Volatility renders Hex columns as integers in JSON.
+        process.seen_in["windows.malware.malfind.Malfind"] = [
+            {"PID": pid, "Start VPN": start, "End VPN": start + 0x1000}
+            for start in regions
+        ]
     return rules.Finding(
         finding_id=f"PROC-{pid:04d}",
         rule_id=rule_id,
@@ -103,34 +110,199 @@ class TestPlanning:
 
 
 class TestDumpPolicy:
-    def test_dumps_are_planned_but_not_executed_by_default(self) -> None:
+    """Rules may recommend a dump; the tool still never performs one unbidden.
+
+    The guarantee that matters is not "no rule asks" but "the tool does not act".
+    A recommendation the analyst can act on is the point; writing malicious code
+    to their workstation without being told to is not.
+    """
+
+    def test_dumps_are_suggested_not_executed_by_default(self) -> None:
         plan = followup.plan([finding(4180, actions=("dump_process",))])
 
         assert len(plan.tasks) == 1
-        assert plan.tasks[0].skipped_reason == "requires --dump"
+        task = plan.tasks[0]
+        assert task.suggested is True
+        assert task.state == "suggested"
         assert plan.pending == []
+        assert plan.suggested == [task]
+
+    def test_a_suggestion_is_not_a_skip(self) -> None:
+        """A skip means the tool could not act; a suggestion means it chose not
+        to. Conflating them makes a policy decision read as a coverage gap."""
+        plan = followup.plan([finding(4180, actions=("dump_process",))])
+
+        assert plan.tasks[0].skipped_reason is None
+        assert plan.tasks[0].suggested_reason is not None
 
     def test_the_reason_and_the_quarantine_risk_are_stated(self) -> None:
         plan = followup.plan([finding(4180, actions=("dump_process", "dump_vads"))])
         notices = " ".join(plan.notices)
 
         assert "--dump" in notices
-        assert "quarantined" in notices
+        assert "quarantine" in notices
+        assert "NOT run" in notices
 
     def test_dump_runs_when_asked_for(self) -> None:
         plan = followup.plan(
             [finding(4180, actions=("dump_process",))], allow_dump=True
         )
 
+        assert plan.tasks[0].suggested is False
         assert plan.tasks[0].skipped_reason is None
         assert plan.tasks[0].plugin_args == ["--dump", "--pid", "4180"]
 
-    def test_the_shipped_pack_recommends_no_dump_actions_yet(self) -> None:
-        """v1 ships read-only. This fails loudly if a dump action is added."""
-        pack = rules.load(rules.DEFAULT_PACK, known_actions=set(followup.ACTIONS))
-        recommended = {a for rule in pack.rules for a in rule.actions}
+    def test_no_dump_ever_executes_without_the_flag(self) -> None:
+        """The property that actually protects the workstation: whatever the
+        rules recommend, nothing runs.
 
-        assert not {a for a in recommended if a.startswith("dump_")}
+        Every dump task ends up suggested or skipped, never pending. Both states
+        appear here — dump_module scopes by --name, which a *process* cannot
+        supply, so it is legitimately a skip rather than a suggestion.
+        """
+        dump_actions = [a for a in followup.ACTIONS if a.startswith("dump_")]
+        assert dump_actions  # the guarantee is vacuous if there are none
+
+        plan = followup.plan([finding(4180, actions=tuple(dump_actions))])
+
+        assert plan.pending == []
+        assert all(t.suggested or t.skipped_reason for t in plan.tasks)
+        assert all(t.state in {"suggested", "skipped"} for t in plan.tasks)
+
+    def test_the_shipped_pack_recommends_dumps_only_where_justified(self) -> None:
+        """A bare malfind region is why PROC-INJECT is medium. Suggesting a dump
+        for every one of them would undo that distinction."""
+        pack = rules.load(rules.DEFAULT_PACK, known_actions=set(followup.ACTIONS))
+        by_rule = {
+            rule.id: {a for a in rule.actions if a.startswith("dump_")}
+            for rule in pack.rules
+        }
+
+        assert by_rule["PROC-INJECT-NET"] == {"dump_vads", "dump_process"}
+        assert by_rule["PROC-GHOST"] == {"dump_process"}
+        assert by_rule["PROC-INJECT"] == set()
+        assert by_rule["PROC-HIDDEN"] == set()
+
+
+class TestRegionScoping:
+    """``VadInfo --dump --pid N`` writes every VAD — gigabytes on a real process.
+    The region the finding cited is a few pages, and is the thing worth keeping.
+    """
+
+    def test_one_task_per_flagged_region(self) -> None:
+        plan = followup.plan(
+            [finding(4180, actions=("dump_vads",),
+                     regions=(0x1A2B3C0000, 0x7FF000))]
+        )
+
+        assert len(plan.tasks) == 2
+        assert [t.region for t in plan.tasks] == ["0x1a2b3c0000", "0x7ff000"]
+
+    def test_the_address_precedes_the_scope_flag(self) -> None:
+        """--pid is a ListRequirement and swallows every token after it, so
+        nothing may follow it — including --address."""
+        plan = followup.plan(
+            [finding(4180, actions=("dump_vads",), regions=(0x1A2B3C0000,))]
+        )
+
+        assert plan.tasks[0].plugin_args == [
+            "--dump", "--address", "0x1a2b3c0000", "--pid", "4180",
+        ]
+
+    def test_duplicate_regions_are_collapsed(self) -> None:
+        plan = followup.plan(
+            [finding(4180, actions=("dump_vads",),
+                     regions=(0x1000, 0x1000, 0x2000))]
+        )
+
+        assert [t.region for t in plan.tasks] == ["0x1000", "0x2000"]
+
+    def test_no_regions_falls_back_to_the_whole_process(self) -> None:
+        """A dump of everything still beats emitting nothing, and the absent
+        region says which was produced."""
+        plan = followup.plan([finding(4180, actions=("dump_vads",))])
+
+        assert len(plan.tasks) == 1
+        assert plan.tasks[0].region is None
+        assert plan.tasks[0].plugin_args == ["--dump", "--pid", "4180"]
+
+    def test_an_unparseable_address_is_ignored_not_fatal(self) -> None:
+        process_finding = finding(4180, actions=("dump_vads",))
+        process_finding.entity.seen_in["windows.malware.malfind.Malfind"] = [
+            {"Start VPN": None}, {"Start VPN": "not-a-number"},
+            {"Start VPN": True}, {"Start VPN": 0x4000},
+        ]
+
+        plan = followup.plan([process_finding])
+
+        assert [t.region for t in plan.tasks] == ["0x4000"]
+
+
+class TestSuggestedCommands:
+    def test_the_command_is_rendered_for_the_analyst(self, lib, tmp_path) -> None:
+        plan = followup.plan(
+            [finding(4180, actions=("dump_vads",), regions=(0x1A2B3C0000,))]
+        )
+
+        followup.render_suggestions(
+            plan, output_dir=tmp_path / "out", engine=lib,
+            symbols_dir=tmp_path / "s", cache_dir=tmp_path / "c",
+            image=tmp_path / "m.raw",
+        )
+
+        command = plan.tasks[0].suggested_command
+        assert "windows.vadinfo.VadInfo" in command
+        assert "--address 0x1a2b3c0000" in command
+        assert command.index("-o ") < command.index("windows.vadinfo.VadInfo")
+        assert command.rstrip().endswith("--pid 4180")
+
+    def test_it_matches_what_the_tool_would_have_run(self, lib, tmp_path) -> None:
+        """Rendered through engine.command, so the suggestion cannot drift from
+        the real argv when option ordering changes."""
+        actions = ("dump_vads",)
+        suggested = followup.plan([finding(4180, actions=actions)])
+        executed = followup.plan([finding(4180, actions=actions)], allow_dump=True)
+
+        followup.render_suggestions(
+            suggested, output_dir=tmp_path / "out", engine=lib,
+            symbols_dir=tmp_path / "s", cache_dir=tmp_path / "c",
+            image=tmp_path / "m.raw",
+        )
+        tasks = followup.build_tasks(
+            executed, image=tmp_path / "m.raw", output_dir=tmp_path / "out",
+            engine=lib, symbols_dir=tmp_path / "s", cache_dir=tmp_path / "c",
+        )
+
+        rendered = " ".join(
+            f'"{a}"' if " " in a else a for a in tasks[0].command
+        )
+        assert suggested.tasks[0].suggested_command == rendered
+
+    def test_without_an_image_a_placeholder_is_used(self, lib, tmp_path) -> None:
+        plan = followup.plan([finding(4180, actions=("dump_process",))])
+
+        followup.render_suggestions(
+            plan, output_dir=tmp_path / "out", engine=lib,
+            symbols_dir=tmp_path / "s", cache_dir=tmp_path / "c",
+        )
+
+        assert followup.IMAGE_PLACEHOLDER in plan.tasks[0].suggested_command
+
+    def test_suggestions_reach_next_steps_json(self, lib, tmp_path) -> None:
+        plan = followup.plan(
+            [finding(4180, actions=("dump_vads",), regions=(0x9000,))]
+        )
+        followup.render_suggestions(
+            plan, output_dir=tmp_path / "out", engine=lib,
+            symbols_dir=tmp_path / "s", cache_dir=tmp_path / "c",
+        )
+
+        path = followup.write(tmp_path / "findings", plan)
+        entry = json.loads(path.read_text(encoding="utf-8"))["tasks"][0]
+
+        assert entry["state"] == "suggested"
+        assert entry["region"] == "0x9000"
+        assert "--address 0x9000" in entry["suggested_command"]
 
 
 class TestTaskConstruction:
