@@ -6,8 +6,18 @@
 # Vendored/downloaded binaries (fetched by the build script; see README)
 /vendor/
 /python/
+/python_packages/
 /lib/
 volatility3.exe
+
+# Artifacts of a *built bundle* unpacked over a checkout. All are produced by
+# tools/build_portable.py, so none belongs in version control — and without these
+# rules they are the files a stray `git add -A` would pick up. Anchored to the
+# root so docs/HOWTO.md, the tracked original, is unaffected.
+/BUILD-FILES.sha256
+/BUILD-MANIFEST.json
+/HOWTO.md
+/v4ag.bat
 
 # Symbol data — windows.zip is 800 MB, never commit
 /symbols/
