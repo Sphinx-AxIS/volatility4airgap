@@ -1,0 +1,10 @@
+# Digest-verified test fixtures.
+#
+# tests/fixtures/triage-sample/run-manifest.json records a SHA-256 for every file
+# beside it, and `analyze` verifies those digests before reading a triage folder.
+# Git for Windows enables core.autocrlf by default, so without this rule every
+# fixture is rewritten LF -> CRLF on checkout, every digest mismatches, and the
+# analysis tests fail on every Windows clone — the platform this tool targets.
+#
+# -text disables all end-of-line conversion for these files in both directions.
+tests/fixtures/** -text
