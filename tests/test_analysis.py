@@ -658,7 +658,13 @@ class TestGuidance:
         result = analysis.analyse(tmp_path)
 
         assert [n.level for n in result.notices] == ["error"]
-        assert "--format csv,json" in result.notices[0].message
+        message = result.notices[0].message
+
+        # The cheapest fix first: analysis reads JSON, so --format json alone
+        # unblocks it. Leading with csv,json asked for a second full pass over
+        # the image to produce output nothing here reads.
+        assert "--format json" in message
+        assert message.index("--format json") < message.index("--format csv,json")
 
     def test_an_empty_folder_is_reported(self, tmp_path) -> None:
         result = analysis.analyse(tmp_path)

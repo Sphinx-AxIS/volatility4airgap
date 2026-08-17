@@ -117,7 +117,7 @@ The main command.
 | `--image PATH` | *required* | The memory image to analyse |
 | `--plugins LIST` | triage set | Comma-separated plugin names and/or categories |
 | `--all` | off | Run every discovered Windows plugin instead |
-| `--format LIST` | `csv,json` | Output formats. Each is a separate Volatility run |
+| `--format LIST` | `csv,json` | Which of `csv` and `json` to write. `--format json` for JSON only, `--format csv` for CSV only. Each format is a separate Volatility run, so one format halves the work. **`analyze` reads JSON and never CSV**, so do not drop `json` if you intend to analyse the results |
 | `--jobs N` | `1` | Plugins to run concurrently. `auto` picks 1–4 |
 | `--engine NAME` | `auto` | `library`, `exe`, or `auto` |
 | `--out DIR` | `output\<image>` | Where results go |
@@ -321,8 +321,18 @@ are exactly what Volatility produces rather than one being derived from the othe
 only need one, say so and halve the work:
 
 ```bat
+:: JSON only — half the runtime, and everything `analyze` needs
+v4ag.bat triage --image E:\img.raw --format json
+
+:: CSV only — for ingest into another tool. `analyze` cannot read this folder
 v4ag.bat triage --image E:\img.raw --format csv
 ```
+
+**Prefer `--format json` when dropping one.** The analysis phase reads the JSON and
+never the CSV, so a CSV-only folder cannot be analysed: `analyze` refuses it and tells
+you to re-run the triage. CSV is for reading and for feeding other tools; JSON is the
+machine interface. Keeping both is only worth the second pass if something downstream
+consumes the CSV.
 
 **`--jobs`.** Defaults to `1`. Whether more helps depends entirely on where the image
 lives:

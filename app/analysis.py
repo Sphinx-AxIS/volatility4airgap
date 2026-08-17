@@ -1378,8 +1378,10 @@ def analyse(output_dir: Path) -> Analysis:
         analysis.note(
             "error",
             "This folder contains CSV output only, and analysis reads JSON.\n"
-            "  Re-run triage with both: v4ag triage --image <image> "
-            "--format csv,json",
+            "  Re-run triage to produce it: v4ag triage --image <image> "
+            "--format json\n"
+            "  Add csv back only if something downstream needs it "
+            "(--format csv,json), which costs a second pass over the image.",
         )
         return analysis
 
