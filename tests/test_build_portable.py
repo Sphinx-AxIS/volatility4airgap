@@ -204,6 +204,62 @@ class TestDownloadVerification:
         )
 
 
+class TestRecordPruning:
+    """A rebuild from identical inputs must produce an identical payload.
+
+    pip regenerates the console-script wrappers under bin/ non-deterministically,
+    and records their digests in each wheel's RECORD. The build strips bin/ but
+    left those lines behind, so two builds of the same wheel differed — and
+    payload_sha256 with them. An approver following the documented check
+    ("rebuild and compare") saw a mismatch that meant nothing.
+    """
+
+    def _tree(self, root: Path, record_lines: list[str]) -> Path:
+        info = root / "lib" / "pkg-1.0.dist-info"
+        info.mkdir(parents=True)
+        (info / "RECORD").write_text("\n".join(record_lines) + "\n", encoding="utf-8")
+        (root / "lib" / "bin").mkdir(parents=True)
+        (root / "lib" / "bin" / "vol.exe").write_bytes(b"MZ wrapper")
+        return root / "lib"
+
+    def test_wrapper_lines_are_dropped(self, tmp_path) -> None:
+        lib = self._tree(tmp_path, [
+            "../../bin/vol.exe,sha256=AAAA,108386",
+            "../../Scripts/volshell.exe,sha256=BBBB,108395",
+            "pkg/__init__.py,sha256=CCCC,12",
+        ])
+
+        bp.strip_host_artifacts(lib)
+
+        kept = (lib / "pkg-1.0.dist-info" / "RECORD").read_text().splitlines()
+        assert kept == ["pkg/__init__.py,sha256=CCCC,12"]
+
+    def test_two_builds_differing_only_in_wrapper_hashes_agree(self, tmp_path) -> None:
+        """The actual regression: the same wheel, two installs, different
+        wrapper digests. After pruning, the payloads must match."""
+        first = self._tree(tmp_path / "a", [
+            "../../bin/vol.exe,sha256=FIRSTHASH,108386",
+            "pkg/__init__.py,sha256=CCCC,12",
+        ])
+        second = self._tree(tmp_path / "b", [
+            "../../bin/vol.exe,sha256=SECONDHASH,108386",
+            "pkg/__init__.py,sha256=CCCC,12",
+        ])
+
+        bp.strip_host_artifacts(first)
+        bp.strip_host_artifacts(second)
+
+        assert bp.payload_digest(first) == bp.payload_digest(second)
+
+    def test_a_record_without_wrappers_is_untouched(self, tmp_path) -> None:
+        lib = self._tree(tmp_path, ["pkg/__init__.py,sha256=CCCC,12"])
+        before = (lib / "pkg-1.0.dist-info" / "RECORD").read_bytes()
+
+        bp.strip_host_artifacts(lib)
+
+        assert (lib / "pkg-1.0.dist-info" / "RECORD").read_bytes() == before
+
+
 class TestRecordedWheels:
     """The manifest must describe the bundle, not the build host's scratch space.
 

@@ -143,6 +143,41 @@ def download(url: str, dest: Path, *, expected_sha256: str | None = None) -> str
     return actual
 
 
+#: Directories pip creates for console scripts, stripped from the bundle.
+_SCRIPT_DIRS = ("bin", "Scripts")
+
+
+def prune_record_files(root: Path) -> int:
+    """Drop RECORD lines naming files this build has removed.
+
+    A wheel's ``RECORD`` lists every installed file with its digest, including
+    the console-script wrappers pip generates under ``bin/``. Those wrappers are
+    stripped from the bundle, so the lines describe files that are not there —
+    and, worse, pip regenerates the wrappers non-deterministically, so their
+    digests differ between two builds of the identical wheel.
+
+    That broke the claim this build makes to an approval authority: rebuild,
+    compare ``payload_sha256``, and identical inputs should give an identical
+    result. They did not, and the mismatch pointed at tampering that had not
+    happened — a false alarm in the mechanism meant to prevent false confidence.
+
+    Pruning the lines fixes both: RECORD then describes what is actually
+    shipping, and stops carrying a value that changes for no reason.
+    """
+    prefixes = tuple(f"../../{d}/" for d in _SCRIPT_DIRS)
+    pruned = 0
+    for record in sorted(root.rglob("*.dist-info/RECORD")):
+        try:
+            lines = record.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        kept = [ln for ln in lines if not ln.startswith(prefixes)]
+        if len(kept) != len(lines):
+            pruned += len(lines) - len(kept)
+            record.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    return pruned
+
+
 def strip_host_artifacts(root: Path) -> tuple[int, int]:
     """Remove bytecode and scripts that belong to the build host, not the target.
 
@@ -150,6 +185,9 @@ def strip_host_artifacts(root: Path) -> tuple[int, int]:
     for the wrong Python version, so the target ignores them — they are dead weight
     that also misleads anyone auditing the bundle. The ``bin/`` directory holds Unix
     ``vol``/``volshell`` shims that cannot run on Windows.
+
+    The RECORD files that referenced those shims are pruned to match, so nothing
+    in the bundle claims a file the bundle does not contain.
     """
     removed_pyc = 0
     for cache in sorted(root.rglob("__pycache__"), reverse=True):
@@ -157,12 +195,13 @@ def strip_host_artifacts(root: Path) -> tuple[int, int]:
         shutil.rmtree(cache, ignore_errors=True)
 
     removed_dirs = 0
-    for junk in ("bin", "Scripts"):
+    for junk in _SCRIPT_DIRS:
         target = root / junk
         if target.is_dir():
             shutil.rmtree(target)
             removed_dirs += 1
 
+    prune_record_files(root)
     return removed_pyc, removed_dirs
 
 
