@@ -215,7 +215,7 @@ class TestShippedPack:
         return rules.load(rules.DEFAULT_PACK, known_actions=set(followup.ACTIONS))
 
     def test_it_loads(self, pack) -> None:
-        assert len(pack.rules) == 15
+        assert len(pack.rules) == 27
 
     def test_every_signal_is_in_its_entitys_vocabulary(self, pack) -> None:
         for rule in pack.rules:
@@ -303,22 +303,28 @@ class TestEvaluation:
 class TestExpectedFindings:
     """The golden test: the whole pipeline over a fixture with known planting."""
 
+    #: PROC-SYSTEM-MASQUERADE is the newest entry. The fixture has always
+    #: planted a fake lsass — parented by powershell, PEB path spoofed, real
+    #: image at \Device\Temp\x.exe — but nothing read the image path, so it was
+    #: only ever caught indirectly, as one more anomaly in PROC-MULTI-SIGNAL.
+    #: Naming what is actually wrong with it raises it to critical.
     EXPECTED = [
         ("KERN-0001", "KERN-SSDT-HOOK", "critical", "evilrk.sys"),
         ("PROC-0001", "PROC-INJECT-NET", "critical", "powershell.exe (PID 4180)"),
         ("PROC-0002", "PROC-THREAD-INJECT", "critical", "powershell.exe (PID 4180)"),
+        ("PROC-0003", "PROC-SYSTEM-MASQUERADE", "critical", "lsass.exe (PID 6000)"),
         ("SVC-0001", "SVC-HOST-INJECTED", "critical", "SysMonSvc (PID 4180)"),
         ("KERN-0002", "KERN-CALLBACK-UNKNOWN", "high", "<unresolved>"),
         ("KERN-0003", "KERN-UNLINKED", "high", "evilrk.sys"),
         ("KERN-0004", "KERN-UNBACKED-DRIVER", "high", "evilrk.sys"),
-        ("PROC-0003", "PROC-MULTI-SIGNAL", "high", "powershell.exe (PID 4180)"),
-        ("PROC-0004", "PROC-HOLLOW", "high", "svchost.exe (PID 5000)"),
-        ("PROC-0005", "PROC-MULTI-SIGNAL", "high", "lsass.exe (PID 6000)"),
-        ("PROC-0006", "PROC-HIDDEN", "high", "rundll32.exe (PID 7224)"),
-        ("PROC-0007", "PROC-XVIEW", "high", "rundll32.exe (PID 7224)"),
+        ("PROC-0004", "PROC-MULTI-SIGNAL", "high", "powershell.exe (PID 4180)"),
+        ("PROC-0005", "PROC-HOLLOW", "high", "svchost.exe (PID 5000)"),
+        ("PROC-0006", "PROC-MULTI-SIGNAL", "high", "lsass.exe (PID 6000)"),
+        ("PROC-0007", "PROC-HIDDEN", "high", "rundll32.exe (PID 7224)"),
+        ("PROC-0008", "PROC-XVIEW", "high", "rundll32.exe (PID 7224)"),
         ("SVC-0002", "SVC-HIDDEN", "high", "GhostSvc"),
         ("SVC-0003", "SVC-USER-PATH", "high", "UpdaterSvc (PID 2100)"),
-        ("PROC-0008", "PROC-INJECT", "medium", "explorer.exe (PID 2100)"),
+        ("PROC-0009", "PROC-INJECT", "medium", "explorer.exe (PID 2100)"),
     ]
 
     def test_matches(self, sample) -> None:
@@ -426,4 +432,4 @@ class TestOutput:
             rows = list(csv_mod.reader(handle))
 
         assert rows[0] == list(rules.CSV_COLUMNS)
-        assert len(rows) == 16  # header plus fifteen findings
+        assert len(rows) == 17  # header plus sixteen findings

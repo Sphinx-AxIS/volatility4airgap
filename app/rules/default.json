@@ -77,6 +77,127 @@
       "actions": ["inspect_vads", "inspect_modules", "inspect_context"]
     },
     {
+      "id": "PROC-SYSTEM-MASQUERADE",
+      "severity": "critical",
+      "title": "System binary running from the wrong directory",
+      "note": "A process carrying the name of a fixed Windows binary whose image is not where Windows keeps it. Judged on the kernel's own record of the image path, not the PEB, which the process can rewrite. Parent and name can both be correct here — this asks the separate question of what is actually executing.",
+      "signal": "system_process_wrong_path",
+      "actions": ["inspect_context", "inspect_modules", "inspect_vads", "dump_process"]
+    },
+    {
+      "id": "PROC-SYSTEM-SESSION",
+      "severity": "high",
+      "title": "Service-only process running in an interactive session",
+      "note": "svchost, services, lsass and wininit belong to session 0. csrss and winlogon are excluded from the check because one of each exists per session.",
+      "signal": "system_process_wrong_session",
+      "actions": ["inspect_context", "inspect_modules"]
+    },
+    {
+      "id": "PROC-SYSTEM-USER",
+      "severity": "high",
+      "title": "System process running as an unexpected account",
+      "note": "lsass, services and wininit run as SYSTEM. svchost is excluded: LocalService and NetworkService are legitimate for it.",
+      "signal": "system_process_wrong_user",
+      "actions": ["inspect_context"]
+    },
+    {
+      "id": "PROC-PROXY-PARENT-CMD",
+      "severity": "critical",
+      "title": "Process launched through an execution proxy, with a suspicious command line",
+      "note": "The parent is a binary whose purpose in a chain is to hide the real launcher, and the command line independently looks like tradecraft. Either alone is worth a look; together they are the shape of a pasted or scripted intrusion.",
+      "all": [
+        { "signal": "lolbin_proxy_parent" },
+        { "signal": "suspicious_command_line" }
+      ],
+      "actions": ["inspect_context", "inspect_vads", "inspect_modules", "dump_process"]
+    },
+    {
+      "id": "PROC-PROXY-PARENT",
+      "severity": "high",
+      "title": "Process launched through an execution proxy",
+      "note": "Parent is pcalua, WmiPrvSE, mshta or forfiles — each a documented way to break the parent/child relationship an examiner would otherwise follow. Deliberately not ancestry-based: the chain above a proxy is precisely what it falsifies.",
+      "all": [
+        { "signal": "lolbin_proxy_parent" },
+        { "none": [{ "signal": "suspicious_command_line" }] }
+      ],
+      "actions": ["inspect_context", "inspect_modules"]
+    },
+    {
+      "id": "PROC-OFFICE-SHELL-NET",
+      "severity": "critical",
+      "title": "Office-spawned shell with external network activity",
+      "note": "A document application has no reason to produce a command interpreter, and one that then talks to a routable address is the standard opening move of a macro or ClickFix delivery.",
+      "all": [
+        { "signal": "office_spawned_shell" },
+        { "signal": "network_external" }
+      ],
+      "actions": ["inspect_context", "inspect_vads", "inspect_modules", "dump_process"]
+    },
+    {
+      "id": "PROC-OFFICE-SHELL",
+      "severity": "high",
+      "title": "Office application spawned a command interpreter",
+      "note": "Derived from ancestry rather than the immediate parent, so a loader placed between the document and the shell does not conceal the relationship.",
+      "all": [
+        { "signal": "office_spawned_shell" },
+        { "none": [{ "signal": "network_external" }] }
+      ],
+      "actions": ["inspect_context", "inspect_modules"]
+    },
+    {
+      "id": "PROC-BROWSER-SHELL",
+      "severity": "high",
+      "title": "Browser spawned a command interpreter",
+      "note": "Browsers spawn helpers and updaters constantly, but not cmd or PowerShell. Ancestry-based, for the same reason as the Office rule.",
+      "signal": "browser_spawned_shell",
+      "actions": ["inspect_context", "inspect_modules"]
+    },
+    {
+      "id": "PROC-ENCODED-NET",
+      "severity": "critical",
+      "title": "Encoded command line with external network activity",
+      "note": "A base64 payload passed to -EncodedCommand is a deliberate attempt to keep the command out of logs. Paired with a routable connection it is not administration.",
+      "all": [
+        { "signal": "encoded_command" },
+        { "signal": "network_external" }
+      ],
+      "actions": ["inspect_context", "inspect_vads", "inspect_modules"]
+    },
+    {
+      "id": "PROC-ENCODED-COMMAND",
+      "severity": "high",
+      "title": "Base64-encoded command line",
+      "note": "Legitimate tooling does use -EncodedCommand to avoid quoting problems, which is why this is not critical on its own.",
+      "all": [
+        { "signal": "encoded_command" },
+        { "none": [{ "signal": "network_external" }] }
+      ],
+      "actions": ["inspect_context"]
+    },
+    {
+      "id": "PROC-SCRIPT-LOLBIN",
+      "severity": "high",
+      "title": "Script engine spawned a signed execution proxy",
+      "note": "wscript, cscript or mshta launching regsvr32, rundll32, certutil or similar. The signed binary is what runs the payload, which is the point of the technique.",
+      "signal": "script_engine_spawned_lolbin",
+      "actions": ["inspect_context", "inspect_modules", "inspect_vads"]
+    },
+    {
+      "id": "PROC-SUSPICIOUS-CMD",
+      "severity": "medium",
+      "title": "Command line matching a known execution technique",
+      "note": "Kept at medium on its own: administrators do write scripts that download and invoke code. The rules above escalate it when something independent agrees.",
+      "all": [
+        { "signal": "suspicious_command_line" },
+        { "none": [
+          { "signal": "lolbin_proxy_parent" },
+          { "signal": "network_external" },
+          { "signal": "malfind" }
+        ] }
+      ],
+      "actions": ["inspect_context"]
+    },
+    {
       "id": "PROC-INJECT",
       "severity": "medium",
       "title": "Executable memory not backed by a file",

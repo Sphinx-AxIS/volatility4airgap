@@ -35,13 +35,39 @@ false negative and a false negative is the expensive kind of wrong here.
 
 from __future__ import annotations
 
+import datetime
 import ipaddress
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import ClassVar
 
 #: Values Volatility uses for "this column does not apply here".
 _ABSENT = {None, "", "N/A", "-", "Disabled", "UNKNOWN", "Unknown"}
+
+_UTC = datetime.timezone.utc
+
+
+def _as_time(value) -> datetime.datetime | None:
+    """Parse a Volatility timestamp, or ``None`` if it is not one.
+
+    Renderers emit either ``2026-07-30T22:05:28+00:00`` or the same with a space
+    separator, and occasionally a trailing ``Z``. A naive result is treated as
+    UTC so two timestamps can always be compared: mixing naive and aware values
+    raises rather than returning a wrong answer, and a raise here would take out
+    the whole analysis for one odd row.
+    """
+    if not _present(value):
+        return None
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=_UTC)
 
 PROCESS = "process"
 MODULE = "module"
@@ -75,6 +101,12 @@ EXTRACTORS: tuple[Extractor, ...] = (
     Extractor("windows.pstree.PsTree", PROCESS, "PID",
               name="ImageFileName", ppid="PPID", offset_prefix="Offset", nested=True),
     Extractor("windows.cmdline.CmdLine", PROCESS, "PID", name="Process"),
+    # Both are in the triage set and were previously collected but never read,
+    # so the session and user a process ran as never reached an entity. Sessions
+    # keys on "Process ID" rather than "PID"; every other process plugin uses
+    # "PID", which is exactly the kind of drift the extractor table exists for.
+    Extractor("windows.sessions.Sessions", PROCESS, "Process ID", name="Process"),
+    Extractor("windows.getsids.GetSIDs", PROCESS, "PID", name="Process"),
     Extractor("windows.netscan.NetScan", PROCESS, "PID", name="Owner"),
     Extractor("windows.netstat.NetStat", PROCESS, "PID", name="Owner"),
     Extractor("windows.malware.malfind.Malfind", PROCESS, "PID", name="Process"),
@@ -159,11 +191,41 @@ class Process(Entity):
     seen_in: dict[str, list[dict]] = field(default_factory=dict)
     signals: set[str] = field(default_factory=set)
 
+    # Derived once from the rows above, by ``populate_details``. Held as fields
+    # rather than re-read per signal because several signals want the same value
+    # and each derivation has a wrinkle worth doing only once.
+    command_line: str | None = None
+    #: The kernel's own record of the image, from PebMasquerade's
+    #: EPROCESS_SeAudit_ImageFileName. Deliberately not the PEB path: the PEB is
+    #: writable by the process, which is the whole point of that plugin.
+    image_path: str | None = None
+    session_id: int | None = None
+    user_name: str | None = None
+    #: The process's own SID, not every SID in its token.
+    user_sid: str | None = None
+    #: Filled in by ``link_processes`` once every process exists.
+    parent_name: str | None = None
+
     kind = PROCESS
 
     @property
     def key(self) -> tuple[int, int | None]:
         return (self.pid, self.offset)
+
+    @property
+    def started_at(self) -> "datetime.datetime | None":
+        """Creation time, from whichever listing recorded one.
+
+        Used to reject a PPID that resolves to a process younger than its
+        supposed child — the signature of a reused PID rather than a parent.
+        """
+        for plugin in ("windows.pslist.PsList", "windows.psscan.PsScan",
+                       "windows.pstree.PsTree"):
+            for row in self.rows(plugin):
+                parsed = _as_time(row.get("CreateTime"))
+                if parsed is not None:
+                    return parsed
+        return None
 
     @property
     def label(self) -> str:
@@ -286,6 +348,90 @@ class Analysis:
 
     def by_pid(self, pid: int) -> list[Process]:
         return [p for p in self.processes if p.pid == pid]
+
+    # ---- process graph ----------------------------------------------------
+    #
+    # Windows reuses PIDs, so a PPID may name a process that has nothing to do
+    # with the child: the real parent exited and something else inherited the
+    # number. Every walk below therefore goes through ``parent``, which refuses
+    # a candidate that started after its supposed child, and bounds itself
+    # against a cycle formed by reuse.
+
+    #: Deep enough for any real chain; short enough that a cycle cannot hang.
+    MAX_ANCESTRY_DEPTH: ClassVar[int] = 32
+
+    def parent(self, process: Process) -> Process | None:
+        """The one process that plausibly launched ``process``.
+
+        ``None`` when the parent has exited (the usual case for csrss, wininit
+        and winlogon, whose smss is long gone), when the PPID resolves to
+        several candidates that cannot be told apart, or when the only candidate
+        started after the child and so cannot be its parent.
+        """
+        if process.ppid is None or process.ppid == process.pid:
+            return None
+
+        candidates = self.by_pid(process.ppid)
+        if not candidates:
+            return None
+
+        child_start = process.started_at
+        plausible = [
+            candidate
+            for candidate in candidates
+            if not (
+                child_start is not None
+                and candidate.started_at is not None
+                and candidate.started_at > child_start
+            )
+        ]
+        if len(plausible) != 1:
+            # Zero: the PID was reused by something younger than the child.
+            # More than one: genuinely ambiguous, and guessing would attribute
+            # a chain to the wrong process — worse than reporting nothing.
+            return None
+        return plausible[0]
+
+    def children(self, process: Process) -> list[Process]:
+        return [p for p in self.processes if self.parent(p) is process]
+
+    def ancestors(self, process: Process) -> list[Process]:
+        """Parent first, then grandparent, and so on. Never repeats a process."""
+        chain: list[Process] = []
+        seen = {id(process)}
+        current = process
+        for _ in range(self.MAX_ANCESTRY_DEPTH):
+            current = self.parent(current)
+            if current is None or id(current) in seen:
+                break
+            seen.add(id(current))
+            chain.append(current)
+        return chain
+
+    def descendants(self, process: Process) -> list[Process]:
+        found: list[Process] = []
+        seen = {id(process)}
+        queue = [process]
+        while queue:
+            current = queue.pop()
+            for child in self.children(current):
+                if id(child) in seen:
+                    continue
+                seen.add(id(child))
+                found.append(child)
+                queue.append(child)
+        return found
+
+    def has_ancestor(self, process: Process, names: frozenset[str]) -> Process | None:
+        """The nearest ancestor whose image name is in ``names``.
+
+        Returned rather than a bool so a finding can name the process it means,
+        which is the difference between "Office-spawned shell" and evidence.
+        """
+        for ancestor in self.ancestors(process):
+            if (ancestor.name or "").lower() in names:
+                return ancestor
+        return None
 
     def entities(self, kind: str) -> list:
         return {
@@ -638,10 +784,71 @@ def _report_drift(
         )
 
 
+#: A path Volatility reports device-relative, e.g.
+#: ``\Device\HarddiskVolume5\Windows\System32\lsass.exe``. The volume prefix
+#: varies by host and says nothing useful, so comparisons use what follows it.
+_DEVICE_PREFIX = re.compile(r"^\\device\\harddiskvolume\d+", re.I)
+
+
+def normalise_path(value) -> str | None:
+    """Lowercase, backslash-separated, with any device prefix removed."""
+    if not _present(value):
+        return None
+    text = str(value).strip().replace("/", "\\").lower()
+    text = _DEVICE_PREFIX.sub("", text)
+    return text or None
+
+
+def _derive_details(process: Process) -> None:
+    """Lift the fields several signals share out of the raw rows, once."""
+    for row in process.rows("windows.cmdline.CmdLine"):
+        if _present(row.get("Args")):
+            process.command_line = str(row["Args"]).strip()
+            break
+
+    # The kernel's own record, not the PEB: PebMasquerade exists because a
+    # process can rewrite its PEB path, so trusting that field here would
+    # believe exactly the lie the plugin was written to expose.
+    for row in process.rows("windows.malware.pebmasquerade.PebMasquerade"):
+        path = normalise_path(row.get("EPROCESS_SeAudit_ImageFileName"))
+        if path:
+            process.image_path = path
+            break
+
+    for row in process.rows("windows.sessions.Sessions"):
+        session = _as_int(row.get("Session ID"))
+        if session is not None:
+            process.session_id = session
+        if _present(row.get("User Name")):
+            process.user_name = str(row["User Name"]).strip()
+        if process.session_id is not None:
+            break
+
+    # GetSIDs lists every SID in the token; the process's own is the one whose
+    # name matches the account, and the first row is it in practice. Taking them
+    # all would make "the user" mean "any group it belongs to".
+    for row in process.rows("windows.getsids.GetSIDs"):
+        if _present(row.get("SID")):
+            process.user_sid = str(row["SID"]).strip()
+            break
+
+
+def link_processes(analysis: Analysis) -> None:
+    """Resolve each process's parent name, once every process exists."""
+    for process in analysis.processes:
+        parent = analysis.parent(process)
+        if parent is not None:
+            process.parent_name = parent.name
+
+
 def build_entities(rows_by_plugin: dict[str, list[dict]], analysis: Analysis) -> None:
     analysis.processes = _build_processes(rows_by_plugin, analysis)
     analysis.modules = _build_modules(rows_by_plugin, analysis)
     analysis.services = _build_services(rows_by_plugin, analysis)
+
+    for process in analysis.processes:
+        _derive_details(process)
+    link_processes(analysis)
 
 
 # --------------------------------------------------------------------------
@@ -656,6 +863,15 @@ VOCABULARY: dict[str, frozenset[str]] = {
             "pslist", "psscan", "psscan_only", "exited", "malfind", "hollow",
             "ghosted", "peb_masquerade", "psxview_hidden", "suspicious_thread",
             "ldrmodules_unlinked", "network", "network_external", "unusual_parent",
+            # Image and context.
+            "system_process_wrong_path", "user_writable_image",
+            "system_process_wrong_session", "system_process_wrong_user",
+            # Command line.
+            "encoded_command", "suspicious_command_line",
+            # Lineage.
+            "lolbin_proxy_parent", "office_spawned_shell",
+            "browser_spawned_shell", "script_engine_spawned_lolbin",
+            "wmi_spawned_process",
         }
     ),
     MODULE: frozenset(
@@ -693,6 +909,17 @@ SIGNAL_SOURCE: dict[str, str] = {
     "network": "windows.netscan.NetScan",
     "network_external": "windows.netscan.NetScan",
     "unusual_parent": "windows.pslist.PsList",
+    "system_process_wrong_path": "windows.malware.pebmasquerade.PebMasquerade",
+    "user_writable_image": "windows.malware.pebmasquerade.PebMasquerade",
+    "system_process_wrong_session": "windows.sessions.Sessions",
+    "system_process_wrong_user": "windows.sessions.Sessions",
+    "encoded_command": "windows.cmdline.CmdLine",
+    "suspicious_command_line": "windows.cmdline.CmdLine",
+    "lolbin_proxy_parent": "windows.pslist.PsList",
+    "office_spawned_shell": "windows.pslist.PsList",
+    "browser_spawned_shell": "windows.pslist.PsList",
+    "script_engine_spawned_lolbin": "windows.pslist.PsList",
+    "wmi_spawned_process": "windows.pslist.PsList",
     # Module.
     "loaded": "windows.modules.Modules",
     "scanned": "windows.modscan.ModScan",
@@ -726,6 +953,108 @@ EXPECTED_PARENT: dict[str, frozenset[str]] = {
     "lsaiso.exe": frozenset({"wininit.exe"}),
     "svchost.exe": frozenset({"services.exe"}),
 }
+
+#: Where Windows keeps the processes whose parent is already fixed above. Held
+#: as a directory rather than a full path because the volume prefix varies and
+#: SysWOW64 is a legitimate home for a 32-bit instance of some of these.
+EXPECTED_IMAGE_DIR: dict[str, tuple[str, ...]] = {
+    "smss.exe": ("\\windows\\system32\\",),
+    "csrss.exe": ("\\windows\\system32\\",),
+    "wininit.exe": ("\\windows\\system32\\",),
+    "winlogon.exe": ("\\windows\\system32\\",),
+    "services.exe": ("\\windows\\system32\\",),
+    "lsass.exe": ("\\windows\\system32\\",),
+    "lsaiso.exe": ("\\windows\\system32\\",),
+    "svchost.exe": ("\\windows\\system32\\", "\\windows\\syswow64\\"),
+    "explorer.exe": ("\\windows\\",),
+    "spoolsv.exe": ("\\windows\\system32\\",),
+    "taskhostw.exe": ("\\windows\\system32\\",),
+}
+
+#: Processes Windows runs only in session 0. csrss and winlogon are deliberately
+#: absent: one of each exists per interactive session, so a non-zero session is
+#: correct for them and flagging it would fire on every healthy host.
+SESSION_ZERO_ONLY = frozenset(
+    {"wininit.exe", "services.exe", "lsass.exe", "lsaiso.exe", "svchost.exe"}
+)
+
+#: The account each of these runs as. Anything else on one of them is either a
+#: masquerade or a token manipulation. svchost is excluded: it legitimately runs
+#: as LocalService and NetworkService as well as SYSTEM.
+EXPECTED_USER: dict[str, frozenset[str]] = {
+    "wininit.exe": frozenset({"system"}),
+    "services.exe": frozenset({"system"}),
+    "lsass.exe": frozenset({"system"}),
+    "smss.exe": frozenset({"system"}),
+    "csrss.exe": frozenset({"system"}),
+    "winlogon.exe": frozenset({"system"}),
+}
+
+#: Binaries whose presence as a *parent* means the real launcher is hidden.
+#: Each is a documented indirect-execution technique, and each was chosen
+#: because it has almost no reason to parent anything in ordinary use.
+#:
+#: pcalua.exe and wmiprvse.exe are here from a real intrusion: a pasted command
+#: ran "pcalua.exe -a powershell", then had WMI create the payload so that its
+#: parent became WmiPrvSE rather than the shell. Two lineage breaks in one line,
+#: both of which defeat a rule that walks ancestry looking for a known-bad pair.
+PROXY_PARENTS: dict[str, str] = {
+    "pcalua.exe": "Program Compatibility Assistant used as a launcher (T1202)",
+    "wmiprvse.exe": "created through WMI, hiding the real parent (T1047)",
+    "mshta.exe": "spawned by the HTML Application host (T1218.005)",
+    "forfiles.exe": "spawned by forfiles, an indirect-execution proxy (T1202)",
+}
+
+OFFICE_PROCESSES = frozenset(
+    {"winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "msaccess.exe",
+     "onenote.exe", "visio.exe", "acrord32.exe", "acrobat.exe"}
+)
+BROWSERS = frozenset(
+    {"msedge.exe", "chrome.exe", "firefox.exe", "iexplore.exe", "brave.exe",
+     "opera.exe"}
+)
+SHELLS = frozenset({"cmd.exe", "powershell.exe", "pwsh.exe"})
+SCRIPT_ENGINES = frozenset({"wscript.exe", "cscript.exe", "mshta.exe"})
+#: Signed Microsoft binaries commonly used to proxy execution of attacker code.
+LOLBINS = frozenset(
+    {"regsvr32.exe", "rundll32.exe", "mshta.exe", "certutil.exe", "bitsadmin.exe",
+     "installutil.exe", "regasm.exe", "regsvcs.exe", "msbuild.exe", "msiexec.exe",
+     "cmstp.exe", "odbcconf.exe"}
+)
+
+#: PowerShell accepts any unambiguous prefix of -EncodedCommand, so -e, -enc and
+#: -encodedcommand are all valid. The long base64 argument is what makes it a
+#: finding rather than a match on -ExecutionPolicy, which shares the prefix but
+#: is followed by a word.
+_ENCODED_COMMAND = re.compile(
+    r"[-/]e[a-z]*\s+[\"']?[A-Za-z0-9+/]{40,}={0,2}", re.I
+)
+
+#: (pattern, why) — the reason is carried into the finding, because "suspicious
+#: command line" on its own tells an examiner nothing they can put in a report.
+SUSPICIOUS_COMMAND: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(r"\biex\b|invoke-expression", re.I),
+     "pipes text into Invoke-Expression"),
+    (re.compile(r"downloadstring|downloadfile|invoke-webrequest|\biwr\b|\birm\b", re.I),
+     "downloads and runs content in memory"),
+    (re.compile(r"frombase64string", re.I), "decodes an embedded base64 payload"),
+    (re.compile(r"-w(indowstyle)?\s+hidden|-noni|-noprofile", re.I),
+     "hides the console window or skips the profile"),
+    (re.compile(r"-ep\s+bypass|executionpolicy\s+bypass", re.I),
+     "bypasses the PowerShell execution policy"),
+    # The drive letter sits between "net use" and the UNC path, so the match
+    # cannot require @SSL to follow the verb directly.
+    (re.compile(r"net\s+use\b.{0,80}@ssl", re.I | re.S),
+     "mounts a remote WebDAV share over HTTPS"),
+    (re.compile(r"regsvr32.{0,40}scrobj", re.I),
+     "executes a remote scriptlet via regsvr32 (Squiblydoo, T1218.010)"),
+    (re.compile(r"win32_process.{0,20}create", re.I),
+     "creates a process through WMI, detaching it from this one"),
+    (re.compile(r"certutil.{0,40}(-urlcache|-decode)", re.I),
+     "uses certutil to fetch or decode a payload"),
+    (re.compile(r"bitsadmin.{0,20}/transfer", re.I),
+     "transfers a file with bitsadmin"),
+)
 
 #: The only modules that legitimately own a system-call table entry.
 KERNEL_MODULES = frozenset(
@@ -849,6 +1178,96 @@ def compute_process_signals(process: Process, analysis: Analysis) -> None:
         names = {(p.name or "").lower() for p in parents if p.name}
         if names and not (names & expected):
             signals.add("unusual_parent")
+
+    _image_signals(process)
+    _context_signals(process)
+    _command_line_signals(process)
+    _lineage_signals(process, analysis)
+
+
+def _image_signals(process: Process) -> None:
+    """Where the executable lives, judged against where it should."""
+    if not process.image_path:
+        return
+
+    name = (process.name or "").lower()
+    expected_dirs = EXPECTED_IMAGE_DIR.get(name)
+    if expected_dirs and not any(d in process.image_path for d in expected_dirs):
+        process.signals.add("system_process_wrong_path")
+
+    # A user-writable image is only remarkable for something claiming to be a
+    # system binary; ordinary applications live under a user profile all the
+    # time, and flagging those would bury the one that matters.
+    if expected_dirs and any(d in process.image_path for d in USER_WRITABLE):
+        process.signals.add("user_writable_image")
+
+
+def _context_signals(process: Process) -> None:
+    """The session and account a process runs under."""
+    name = (process.name or "").lower()
+
+    if (
+        process.session_id is not None
+        and name in SESSION_ZERO_ONLY
+        and process.session_id != 0
+    ):
+        process.signals.add("system_process_wrong_session")
+
+    expected_users = EXPECTED_USER.get(name)
+    if expected_users and process.user_name:
+        # Volatility renders these as DOMAIN\user or /SYSTEM depending on the
+        # account; the trailing component is the part worth comparing.
+        account = process.user_name.replace("/", "\\").rsplit("\\", 1)[-1].lower()
+        if account and account not in expected_users:
+            process.signals.add("system_process_wrong_user")
+
+
+def _command_line_signals(process: Process) -> None:
+    if not process.command_line:
+        return
+    if _ENCODED_COMMAND.search(process.command_line):
+        process.signals.add("encoded_command")
+    for pattern, _reason in SUSPICIOUS_COMMAND:
+        if pattern.search(process.command_line):
+            process.signals.add("suspicious_command_line")
+            break
+
+
+def command_line_reasons(process: Process) -> list[str]:
+    """Why a command line was called suspicious. Used by the report."""
+    if not process.command_line:
+        return []
+    return [
+        reason
+        for pattern, reason in SUSPICIOUS_COMMAND
+        if pattern.search(process.command_line)
+    ]
+
+
+def _lineage_signals(process: Process, analysis: Analysis) -> None:
+    """What launched this, and what that launched in turn.
+
+    Ancestry rather than immediate parent, so a loader inserted between the
+    document and the shell does not hide the relationship. The proxy-parent
+    check is separate and deliberately *not* ancestry-based: the point of
+    pcalua and WMI is that the chain above them is a lie.
+    """
+    name = (process.name or "").lower()
+
+    parent = analysis.parent(process)
+    if parent is not None and (parent.name or "").lower() in PROXY_PARENTS:
+        process.signals.add("lolbin_proxy_parent")
+        if (parent.name or "").lower() == "wmiprvse.exe":
+            process.signals.add("wmi_spawned_process")
+
+    if name in SHELLS or name in SCRIPT_ENGINES:
+        if analysis.has_ancestor(process, OFFICE_PROCESSES):
+            process.signals.add("office_spawned_shell")
+        if analysis.has_ancestor(process, BROWSERS):
+            process.signals.add("browser_spawned_shell")
+
+    if name in LOLBINS and analysis.has_ancestor(process, SCRIPT_ENGINES):
+        process.signals.add("script_engine_spawned_lolbin")
 
 
 def compute_module_signals(module: Module, analysis: Analysis) -> None:
