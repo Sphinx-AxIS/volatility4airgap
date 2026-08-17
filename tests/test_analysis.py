@@ -348,6 +348,30 @@ class TestProcessGraph:
         assert [p.pid for p in chain] == [200]
 
 
+class TestExpectedParents:
+    def test_the_session_instance_of_smss_is_normal(self) -> None:
+        """Regression: the master smss spawns one copy of itself per session.
+
+        Allowing only System as smss's parent fired on every session the host
+        had ever created — two on a real capture, both long exited — which is
+        noise on exactly the table that is kept short to avoid it.
+        """
+        result = analysed_from([
+            (4, 0, "System"),
+            (1732, 4, "smss.exe"),       # master
+            (1964, 1732, "smss.exe"),    # session instance
+        ])
+
+        assert "unusual_parent" not in signals_of(result, 1964)
+        assert "unusual_parent" not in signals_of(result, 1732)
+
+    def test_smss_parented_by_something_else_still_fires(self) -> None:
+        result = analysed_from([
+            (2100, 900, "explorer.exe"), (1964, 2100, "smss.exe"),
+        ])
+        assert "unusual_parent" in signals_of(result, 1964)
+
+
 class TestDerivedDetails:
     def test_sessions_keys_on_its_own_column(self) -> None:
         """Sessions spells it 'Process ID'; every other process plugin uses

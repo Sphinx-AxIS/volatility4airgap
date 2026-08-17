@@ -944,7 +944,12 @@ SIGNAL_SOURCE: dict[str, str] = {
 #: but legitimate application, and the value here is in the few relationships
 #: that malware is known to break.
 EXPECTED_PARENT: dict[str, frozenset[str]] = {
-    "smss.exe": frozenset({"system"}),
+    # The master smss is a child of System. It then spawns one instance of
+    # itself per new session, which initialises that session — creating its
+    # csrss and winlogon — and exits immediately. smss parented by smss is
+    # therefore normal, and allowing only "system" here fired on every session
+    # ever created on the host: two on a real capture, both already exited.
+    "smss.exe": frozenset({"system", "smss.exe"}),
     "csrss.exe": frozenset({"smss.exe"}),
     "wininit.exe": frozenset({"smss.exe"}),
     "winlogon.exe": frozenset({"smss.exe"}),
