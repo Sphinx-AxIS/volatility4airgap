@@ -421,6 +421,18 @@ def render_suggestions(
     is a ListRequirement that swallows everything after it.
     """
     for task in plan_.suggested:
+        target = output_dir / task.directory
+        # Volatility refuses to start when -o names a directory that is not
+        # there ("The output directory specified does not exist"), and a
+        # suggested task never ran, so nothing has created it. Without this the
+        # command fails the moment it is pasted — which is the one thing a
+        # copy-pasteable command must not do. An empty directory is also honest:
+        # it marks where that evidence belongs.
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
         argv = engine.command(
             Path(IMAGE_PLACEHOLDER) if image is None else image,
             task.plugin,
@@ -428,7 +440,7 @@ def render_suggestions(
             symbols_dir=symbols_dir,
             cache_dir=cache_dir,
             swap_files=pagefiles,
-            output_dir=output_dir / task.directory,
+            output_dir=target,
             plugin_args=task.plugin_args,
         )
         task.suggested_command = " ".join(_quote(a) for a in argv)

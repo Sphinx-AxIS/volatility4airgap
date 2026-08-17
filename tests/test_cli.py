@@ -420,13 +420,22 @@ class TestAnalyzeCommand:
         assert "PROC-0001" in out
 
     def test_runs_no_volatility_without_an_image(self, sample, capsys) -> None:
-        """The whole point of the separate command: no image, no engine."""
+        """The whole point of the separate command: no image, no engine.
+
+        Asserted as "no evidence was collected" rather than "followup/ is
+        absent": a suggested dump has its directory prepared even with no image,
+        because Volatility refuses to start when -o names a directory that does
+        not exist and nothing else will ever create it. An empty directory is
+        not a collected artefact.
+        """
         main(["analyze", str(sample)])
         out = capsys.readouterr().out
 
         assert "planned but not run" in out
         assert "--image" in out
-        assert not (sample / "followup").exists()
+
+        collected = [p for p in (sample / "followup").rglob("*") if p.is_file()]
+        assert collected == []
 
     def test_a_missing_directory_exits_two(self, tmp_path, capsys) -> None:
         code = main(["analyze", str(tmp_path / "absent")])

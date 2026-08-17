@@ -278,6 +278,25 @@ class TestSuggestedCommands:
         )
         assert suggested.tasks[0].suggested_command == rendered
 
+    def test_the_output_directory_exists_so_the_command_runs(self, lib, tmp_path) -> None:
+        """Volatility exits immediately when -o names a directory that is not
+        there. A suggested task never ran, so nothing else creates it, and the
+        command would fail the moment it was pasted."""
+        plan = followup.plan(
+            [finding(4180, actions=("dump_vads",), regions=(0x9000,))]
+        )
+        out = tmp_path / "out"
+
+        followup.render_suggestions(
+            plan, output_dir=out, engine=lib,
+            symbols_dir=tmp_path / "s", cache_dir=tmp_path / "c",
+        )
+
+        command = plan.tasks[0].suggested_command
+        target = Path(command.split(" -o ")[1].split(" windows.")[0].strip('"'))
+        assert target.is_dir()
+        assert target == out / "followup" / "PID-4180"
+
     def test_without_an_image_a_placeholder_is_used(self, lib, tmp_path) -> None:
         plan = followup.plan([finding(4180, actions=("dump_process",))])
 
