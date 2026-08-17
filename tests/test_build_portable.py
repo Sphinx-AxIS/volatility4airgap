@@ -204,6 +204,39 @@ class TestDownloadVerification:
         )
 
 
+class TestRecordedWheels:
+    """The manifest must describe the bundle, not the build host's scratch space.
+
+    The wheel cache is shared between builds and never pruned. When a dependency
+    publishes a new release, the old wheel stays behind, pip installs only the
+    new one, and a manifest built from the cache listing claims a version that is
+    not in the bundle. A real build recorded leechcorepyc twice this way.
+    """
+
+    def _lib_with(self, root: Path, dists: dict[str, str]) -> Path:
+        lib = root / "lib"
+        for name, version in dists.items():
+            (lib / f"{name}-{version}.dist-info").mkdir(parents=True)
+        return lib
+
+    def test_reads_what_pip_installed(self, tmp_path) -> None:
+        lib = self._lib_with(tmp_path, {"volatility3": "2.28.0", "pefile": "2024.8.26"})
+
+        assert bp.installed_distributions(lib) == {
+            ("volatility3", "2.28.0"), ("pefile", "2024.8.26"),
+        }
+
+    def test_underscores_and_dashes_compare_equal(self, tmp_path) -> None:
+        """dist-info says yara_python; the wheel filename may differ in
+        separator. PEP 503 normalisation is what makes them match."""
+        assert bp._project_key("yara_python") == bp._project_key("yara-python")
+        assert bp._project_key("Pillow") == bp._project_key("pillow")
+
+    def test_an_empty_lib_reports_nothing(self, tmp_path) -> None:
+        (tmp_path / "lib").mkdir()
+        assert bp.installed_distributions(tmp_path / "lib") == set()
+
+
 class TestPinnedConstants:
     def test_python_pin_is_a_full_sha256(self) -> None:
         assert len(bp.PYTHON_SHA256) == 64

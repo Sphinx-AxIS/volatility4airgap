@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -165,11 +166,33 @@ def strip_host_artifacts(root: Path) -> tuple[int, int]:
     return removed_pyc, removed_dirs
 
 
-def install_dependencies(lib_dir: Path, wheel_cache: Path) -> list[dict]:
-    """Fetch Windows wheels, record their hashes, then unpack them into ``lib``.
+def _project_key(name: str) -> str:
+    """PEP 503 normalisation, so a dist-info and a wheel filename compare equal."""
+    return re.sub(r"[-_.]+", "-", name).lower()
 
-    Downloading first means the manifest can name every wheel and its digest, and
-    a later build can be repeated offline from the same cache.
+
+def installed_distributions(lib_dir: Path) -> set[tuple[str, str]]:
+    """``(normalised name, version)`` for everything pip actually put in ``lib``."""
+    found = set()
+    for info in lib_dir.glob("*.dist-info"):
+        name, _, version = info.name[: -len(".dist-info")].rpartition("-")
+        if name and version:
+            found.add((_project_key(name), version))
+    return found
+
+
+def install_dependencies(lib_dir: Path, wheel_cache: Path) -> list[dict]:
+    """Fetch Windows wheels, unpack them into ``lib``, and record what went in.
+
+    The wheel cache is shared between builds and never pruned, so it accumulates
+    versions: an earlier build's wheel stays behind when a newer release appears,
+    and pip then installs only the newer one. Recording the cache contents
+    therefore over-reports — a real build listed leechcorepyc twice, once for a
+    version that was not in the bundle at all.
+
+    The manifest is the evidence package an approval authority reads, so what it
+    records is derived from the ``.dist-info`` directories pip left in ``lib``.
+    That is what is actually shipping, by construction.
     """
     wheel_cache.mkdir(parents=True, exist_ok=True)
     platform_args = [
@@ -186,11 +209,9 @@ def install_dependencies(lib_dir: Path, wheel_cache: Path) -> list[dict]:
         stdout=subprocess.DEVNULL,
     )
 
-    wheels = sorted(wheel_cache.glob("*.whl"))
-    if not wheels:
+    if not sorted(wheel_cache.glob("*.whl")):
         raise SystemExit("pip download produced no wheels")
 
-    log(f"installing {len(wheels)} wheels into lib/")
     subprocess.run(
         [sys.executable, "-m", "pip", "install", REQUIREMENT,
          "--target", str(lib_dir), "--no-index",
@@ -200,10 +221,32 @@ def install_dependencies(lib_dir: Path, wheel_cache: Path) -> list[dict]:
         stdout=subprocess.DEVNULL,
     )
 
-    return [
-        {"file": w.name, "size_bytes": w.stat().st_size, "sha256": sha256_file(w)}
-        for w in wheels
-    ]
+    installed = installed_distributions(lib_dir)
+    recorded, matched = [], set()
+    for wheel in sorted(wheel_cache.glob("*.whl")):
+        parts = wheel.name.split("-")
+        if len(parts) < 2:
+            continue
+        key = (_project_key(parts[0]), parts[1])
+        if key not in installed or key in matched:
+            continue
+        matched.add(key)
+        recorded.append({
+            "file": wheel.name,
+            "size_bytes": wheel.stat().st_size,
+            "sha256": sha256_file(wheel),
+        })
+
+    # A distribution in lib/ with no wheel behind it would leave the manifest
+    # silently incomplete, which is the failure this function exists to avoid.
+    unaccounted = sorted(f"{n} {v}" for n, v in installed - matched)
+    if unaccounted:
+        log(f"WARNING: no wheel found for {', '.join(unaccounted)}")
+
+    stale = len(sorted(wheel_cache.glob("*.whl"))) - len(recorded)
+    log(f"installed {len(recorded)} distribution(s) into lib/"
+        + (f" ({stale} older wheel(s) in the cache not used)" if stale > 0 else ""))
+    return recorded
 
 
 def copy_app(source: Path, dest: Path) -> None:
