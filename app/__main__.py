@@ -555,8 +555,13 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     result = analysis_mod.analyse(output_dir)
 
     for notice in result.notices:
-        prefix = "error: " if notice.level == "error" else "warning: "
-        print(f"\n{prefix}{notice.message}", file=sys.stderr)
+        # Label each level as itself. Printing an informational notice as
+        # "warning:" is how warnings stop being read.
+        prefix = {"error": "error: ", "warning": "warning: "}.get(
+            notice.level, "note: "
+        )
+        stream = sys.stderr if notice.level in ("error", "warning") else sys.stdout
+        print(f"\n{prefix}{notice.message}", file=stream)
     if any(n.level == "error" for n in result.notices):
         return 1
 

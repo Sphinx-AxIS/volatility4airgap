@@ -73,6 +73,10 @@ PROCESS = "process"
 MODULE = "module"
 SERVICE = "service"
 
+#: Stands in for a callback or SSDT owner that could not be identified. It is
+#: not a module name — nothing can be filtered by it, so it supplies no scope.
+UNRESOLVED = "<unresolved>"
+
 
 @dataclass(frozen=True)
 class Extractor:
@@ -287,7 +291,17 @@ class Module(Entity):
         ``scope_name`` therefore preserves the case of the source, preferring
         the BaseDllName that Modules and ModScan report because that is the
         exact string the filter compares against.
+
+        A placeholder key supplies nothing. ``<unresolved>`` stands for a
+        callback or SSDT entry whose owning module could not be identified —
+        there is no such module name to filter on, and passing the placeholder
+        through sent Modules and ModScan to search a 25 GB image for a driver
+        literally called "<unresolved>", taking fifteen minutes to return
+        nothing. Returning no scope routes it to the path that already exists
+        for this: the step is skipped and the reason is reported.
         """
+        if self.key == UNRESOLVED:
+            return {}
         return {"name": self.scope_name or self.key}
 
     def as_entity(self) -> dict:
@@ -666,6 +680,8 @@ def _build_processes(
             (pid, offset), Process(pid=pid, offset=offset, offset_kind=kind)
         )
 
+    discarded: list[str] = []
+
     # Offset-bearing plugins run first, so later offset-less rows attach to a
     # fully identified entity rather than creating a shadow of it.
     plugins = [p for p in rows_by_plugin if BY_PLUGIN[p].entity == PROCESS]
@@ -675,6 +691,12 @@ def _build_processes(
         for row in rows_by_plugin[plugin]:
             pid = _as_int(row.get(extractor.key))
             if pid is None:
+                continue
+            reason = implausible_process(row)
+            if reason is not None:
+                # Counted and reported below, never dropped in silence: a real
+                # process discarded here would be a false negative.
+                discarded.append(f"PID {pid} from {plugin.rsplit('.', 1)[-1]} ({reason})")
                 continue
             recognised += 1
 
@@ -693,6 +715,18 @@ def _build_processes(
                 process.ppid = _as_int(row.get(extractor.ppid))
 
         _report_drift(plugin, extractor, rows_by_plugin[plugin], recognised, analysis)
+
+    if discarded:
+        shown = "; ".join(discarded[:5])
+        more = f" (and {len(discarded) - 5} more)" if len(discarded) > 5 else ""
+        analysis.note(
+            "info",
+            f"Discarded {len(discarded)} pool-scan hit(s) that cannot describe a "
+            f"real process: {shown}{more}.\n"
+            "  These are coincidental matches on the _EPROCESS signature. Left in "
+            "place they read as hidden processes and send follow-up plugins "
+            "searching the image for something that was never there.",
+        )
 
     return sorted(entities.values(), key=lambda p: p.sort_key)
 
@@ -717,7 +751,7 @@ def _build_modules(
             if key is None:
                 if plugin not in ("windows.callbacks.Callbacks", "windows.ssdt.SSDT"):
                     continue
-                key = "<unresolved>"
+                key = UNRESOLVED
             recognised += 1
 
             module = entities.setdefault(key, Module(key=key))
@@ -1075,6 +1109,44 @@ USER_WRITABLE = ("\\users\\", "\\temp\\", "\\appdata\\", "\\tmp\\",
 
 _NETWORK_PLUGINS = ("windows.netscan.NetScan", "windows.netstat.NetStat")
 
+#: Windows process IDs are allocated below this; anything above is not one.
+_MAX_PID = 4_194_304
+#: Generous: the busiest real process on a loaded server stays in the hundreds.
+_MAX_THREADS = 10_000
+#: A process image name is a filename. None of these can appear in one.
+_INVALID_IN_NAME = set('\\/:*?"<>|')
+
+
+def implausible_process(row: dict) -> str | None:
+    """Why this row cannot describe a real process, or ``None`` if it might.
+
+    Pool scanning recovers anything shaped like an ``_EPROCESS``, and on a
+    multi-gigabyte image some of those hits are coincidence rather than a
+    process. One such row — name ``\\``, PPID 3,014,702, 7,143,525 threads —
+    satisfied every clause of ``psscan_only`` (present in PsScan, absent from
+    PsList, no exit time), became a high-severity finding, and sent eight
+    follow-up plugins to search a 25 GB image for a process that never existed.
+
+    This is the same failure the kernel-symbol scan already guards against,
+    where most ``RSDS`` matches in raw memory are coincidental. The bounds here
+    are deliberately loose: they reject the physically impossible, not the
+    merely unusual, so a real process is never discarded to tidy up output.
+    """
+    name = row.get("ImageFileName") or row.get("Process") or row.get("Name")
+    if _present(name) and set(str(name)) & _INVALID_IN_NAME:
+        return f"image name {str(name)!r} is not a valid filename"
+
+    threads = _as_int(row.get("Threads"))
+    if threads is not None and (threads < 0 or threads > _MAX_THREADS):
+        return f"{threads:,} threads"
+
+    for field_name in ("PID", "PPID"):
+        value = _as_int(row.get(field_name))
+        if value is not None and (value < 0 or value > _MAX_PID):
+            return f"{field_name} {value:,} is outside the range Windows allocates"
+
+    return None
+
 
 def _has_exit_time(process: Process) -> bool:
     for plugin in ("windows.psscan.PsScan", "windows.pslist.PsList",
@@ -1303,7 +1375,7 @@ def compute_module_signals(module: Module, analysis: Analysis) -> None:
 
     if module.rows("windows.callbacks.Callbacks"):
         signals.add("owns_callback")
-        if module.key == "<unresolved>":
+        if module.key == UNRESOLVED:
             signals.add("unresolved_callback")
 
     for row in module.rows("windows.ssdt.SSDT"):
@@ -1433,3 +1505,5 @@ def analyse(output_dir: Path) -> Analysis:
         )
 
     return analysis
+
+

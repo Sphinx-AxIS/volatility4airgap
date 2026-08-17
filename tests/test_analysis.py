@@ -348,6 +348,95 @@ class TestProcessGraph:
         assert [p.pid for p in chain] == [200]
 
 
+class TestImplausibleProcesses:
+    """Pool scanning recovers anything shaped like an _EPROCESS, and on a
+    multi-gigabyte image some hits are coincidence.
+
+    A real capture produced one: name "\\", PPID 3,014,702, 7,143,525 threads.
+    It satisfied every clause of psscan_only — in PsScan, absent from PsList, no
+    exit time — became a high-severity finding, and sent eight follow-up plugins
+    to search a 25 GB image for a process that never existed. Fifteen minutes of
+    scanning returned empty files.
+    """
+
+    GARBAGE = {
+        "PID": 8, "PPID": 3014702, "ImageFileName": "\\",
+        "Threads": 7143525, "Offset(V)": 253490878726408,
+        "CreateTime": "2026-08-14T19:26:20+00:00", "ExitTime": None,
+    }
+
+    def test_the_real_carved_row_is_rejected(self) -> None:
+        assert analysis.implausible_process(self.GARBAGE) is not None
+
+    @pytest.mark.parametrize("field,value", [
+        ("ImageFileName", "\\"),
+        ("ImageFileName", "a/b"),
+        ("Threads", 7143525),
+        ("PID", 99999999),
+        ("PPID", 99999999),
+    ])
+    def test_each_impossibility_alone_is_enough(self, field, value) -> None:
+        row = {"PID": 900, "PPID": 660, "ImageFileName": "svchost.exe", "Threads": 12}
+        row[field] = value
+        assert analysis.implausible_process(row) is not None
+
+    def test_a_merely_improbable_ppid_is_allowed(self) -> None:
+        """The captured row's PPID of 3,014,702 is absurd but below the ceiling
+        Windows allocates from, so it is not impossible. The row is rejected on
+        its name and thread count instead. Tightening this to catch it — PIDs
+        are in practice multiples of four — would trade a certain false negative
+        for a cosmetic gain, and a discarded real process is the expensive
+        direction to be wrong in."""
+        row = {"PID": 900, "PPID": 3014702, "ImageFileName": "svchost.exe",
+               "Threads": 12}
+        assert analysis.implausible_process(row) is None
+
+    @pytest.mark.parametrize("row", [
+        {"PID": 4, "PPID": 0, "ImageFileName": "System", "Threads": 180},
+        {"PID": 900, "PPID": 660, "ImageFileName": "svchost.exe", "Threads": 12},
+        # Bounds are loose on purpose: unusual must still pass.
+        {"PID": 31337, "PPID": 4, "ImageFileName": "weird-name.exe", "Threads": 4000},
+        # Missing columns must not be treated as impossible values.
+        {"PID": 900, "ImageFileName": None, "Threads": None, "PPID": None},
+    ])
+    def test_real_processes_survive(self, row) -> None:
+        assert analysis.implausible_process(row) is None
+
+    def test_it_never_becomes_an_entity(self) -> None:
+        result = analysis.Analysis()
+        analysis.build_entities({"windows.psscan.PsScan": [
+            self.GARBAGE,
+            {"PID": 900, "PPID": 660, "ImageFileName": "svchost.exe",
+             "Threads": 12, "Offset(V)": 0xB000},
+        ]}, result)
+
+        assert [p.pid for p in result.processes] == [900]
+
+    def test_the_discard_is_reported_not_silent(self) -> None:
+        """A real process dropped here would be a false negative, so the
+        analyst is told what went and why."""
+        result = analysis.Analysis()
+        analysis.build_entities(
+            {"windows.psscan.PsScan": [self.GARBAGE]}, result
+        )
+
+        (notice,) = [n for n in result.notices if "Discarded" in n.message]
+        assert "PID 8" in notice.message
+        assert notice.level == "info"
+
+
+class TestUnresolvedModuleScope:
+    def test_a_placeholder_supplies_no_scope(self) -> None:
+        """<unresolved> is not a module name. Passing it through sent Modules
+        and ModScan to search a 25 GB image for a driver called "<unresolved>",
+        taking fifteen minutes to return nothing."""
+        assert analysis.Module(key=analysis.UNRESOLVED).scope_values() == {}
+
+    def test_a_real_module_still_scopes_by_name(self) -> None:
+        module = analysis.Module(key="wdf01000", scope_name="Wdf01000.sys")
+        assert module.scope_values() == {"name": "Wdf01000.sys"}
+
+
 class TestExpectedParents:
     def test_the_session_instance_of_smss_is_normal(self) -> None:
         """Regression: the master smss spawns one copy of itself per session.
