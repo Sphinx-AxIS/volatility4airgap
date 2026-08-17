@@ -170,7 +170,10 @@ class TestTaskConstruction:
         )
         argv = tasks[0].command
 
-        assert argv[argv.index("-o") + 1].endswith("followup/PID-4180")
+        # Compare path components, not a string suffix: the separator is native,
+        # so a hardcoded "followup/PID-4180" fails on the Windows hosts this tool
+        # is built for.
+        assert Path(argv[argv.index("-o") + 1]) == tmp_path / "out" / "followup" / "PID-4180"
 
     def test_skipped_tasks_produce_no_command(self, lib, tmp_path) -> None:
         plan = followup.plan([finding(4180, actions=("dump_process",))])
