@@ -773,3 +773,113 @@ class TestStringsHitsCommand:
         assert main(["strings-hits", "--image", str(tmp_path / "no.raw"), "--term", "x"]) == 2
         assert main(["strings-hits", "--image", str(image), "--strings-file", str(wrapped_strings),
                      "--out", str(tmp_path / "r"), "--term", "x", "--max-hits", "0"]) == 2
+
+
+class TestProbeOffsets:
+    def test_reports_line_count_and_largest_offset(self, tmp_path) -> None:
+        path = tmp_path / "s.strings"
+        path.write_bytes(b"100:low\n%d:high\n900:mid\n" % (2 * WRAP + 5))
+        probe = S.probe_offsets(path)
+        assert probe.lines == 3
+        assert probe.max_offset == 2 * WRAP + 5
+
+    def test_empty_file_has_no_offset(self, tmp_path) -> None:
+        path = tmp_path / "s.strings"
+        path.write_bytes(b"")
+        probe = S.probe_offsets(path)
+        assert probe.lines == 0 and probe.max_offset == -1
+
+    def test_finds_the_climb_across_many_blocks(self, tmp_path) -> None:
+        # ascending offsets, a tiny block size: the maximum sits in a late block
+        # and must still be sampled.
+        path = tmp_path / "s.strings"
+        path.write_bytes(b"".join(b"%d:line %d\n" % (i * 10, i) for i in range(1000)))
+        probe = S.probe_offsets(path, block_size=64)
+        assert probe.lines == 1000 and probe.max_offset == 999 * 10
+
+
+class TestStringsMapCommand:
+    def _true_offset_file(self, tmp_path):
+        # an offset past WRAP proves this is not a wrapped 32-bit file
+        path = tmp_path / "true.strings"
+        path.write_bytes(b"100:needle low\n%d:needle high\n" % (2 * WRAP + 100))
+        return path
+
+    def test_attributes_the_whole_file_to_csv(
+        self, tmp_path, image, fake_engine, monkeypatch, capsys
+    ) -> None:
+        monkeypatch.setattr(S, "WRAP", WRAP)
+        strings_file = self._true_offset_file(tmp_path)
+        fake_engine.rows = [
+            {"String": "needle high", "Physical Address": 1, "Result": "FREE MEMORY"}
+        ]
+        out = tmp_path / "r"
+        assert main(["strings-map", "--image", str(image), "--strings-file",
+                     str(strings_file), "--out", str(out)]) == 0
+        call = fake_engine.calls[0]
+        assert call["plugin"] == "windows.strings.Strings"
+        assert call["renderer"] == "csv"
+        # the WHOLE file goes to the plugin, not a filtered hits file
+        assert call["plugin_args"] == ["--strings-file", str(strings_file)]
+        assert (out / "strings" / "strings-map.csv").is_file()
+        record = json.loads((out / "strings" / "strings-map.json").read_text())
+        assert record["status"] == "ok" and record["lines"] == 2
+        assert record["output"] == "strings-map.csv"
+        assert "no more map builds" in capsys.readouterr().out
+
+    def test_refuses_a_wrapped_offset_file(
+        self, tmp_path, image, fake_engine, monkeypatch, capsys
+    ) -> None:
+        monkeypatch.setattr(S, "WRAP", WRAP)
+        # every offset below WRAP though the image is 3*WRAP: the wrapped signature
+        wrapped = tmp_path / "w.strings"
+        wrapped.write_bytes(b"100:needle\n900:more\n")
+        out = tmp_path / "r"
+        assert main(["strings-map", "--image", str(image), "--strings-file",
+                     str(wrapped), "--out", str(out)]) == 5
+        assert "wrap" in capsys.readouterr().err.lower()
+        assert fake_engine.calls == []
+
+    def test_force_attributes_a_wrapped_file(
+        self, tmp_path, image, fake_engine, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(S, "WRAP", WRAP)
+        wrapped = tmp_path / "w.strings"
+        wrapped.write_bytes(b"100:needle\n900:more\n")
+        out = tmp_path / "r"
+        assert main(["strings-map", "--image", str(image), "--strings-file",
+                     str(wrapped), "--out", str(out), "--force"]) == 0
+        assert fake_engine.calls[0]["renderer"] == "csv"
+        record = json.loads((out / "strings" / "strings-map.json").read_text())
+        assert record["offsets"] == "forced"
+
+    def test_default_strings_file_is_the_one_strings_wrote(
+        self, tmp_path, image, fake_engine, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(S, "WRAP", WRAP)
+        out = tmp_path / "results"
+        assert main(["strings", "--image", str(image), "--out", str(out)]) == 0
+        assert main(["strings-map", "--image", str(image), "--out", str(out)]) == 0
+        assert fake_engine.calls[0]["plugin_args"] == [
+            "--strings-file", str(out / "strings" / "mem.strings"),
+        ]
+
+    def test_overwrite_and_bad_input(
+        self, tmp_path, image, fake_engine, monkeypatch, capsys
+    ) -> None:
+        monkeypatch.setattr(S, "WRAP", WRAP)
+        strings_file = self._true_offset_file(tmp_path)
+        out = tmp_path / "r"
+        assert main(["strings-map", "--image", str(image), "--strings-file",
+                     str(strings_file), "--out", str(out)]) == 0
+        # a second run refuses to clobber the CSV
+        assert main(["strings-map", "--image", str(image), "--strings-file",
+                     str(strings_file), "--out", str(out)]) == 2
+        assert "--overwrite" in capsys.readouterr().err
+        assert main(["strings-map", "--image", str(image), "--strings-file",
+                     str(strings_file), "--out", str(out), "--overwrite"]) == 0
+        # missing image, missing strings file
+        assert main(["strings-map", "--image", str(tmp_path / "no.raw"),
+                     "--strings-file", str(strings_file)]) == 2
+        assert main(["strings-map", "--image", str(image), "--out", str(out),
+                     "--strings-file", str(tmp_path / "no.strings")]) == 2

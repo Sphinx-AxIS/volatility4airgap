@@ -298,6 +298,50 @@ same thing. And it maps every process's whole address space before it answers, s
 large image the run is minutes even for a handful of lines — `--pid` narrows that when
 you already know whose memory you are asking about.
 
+### `strings-map` — attribute the whole file once, then grep
+
+That reverse map is the whole cost, and it is the same map no matter how many strings you
+look up. `strings-hits` rebuilds it for every search, which is right for one or two terms
+but wasteful when you are hunting: an hour of map-building per term. `strings-map` builds it
+**once**, attributes the entire strings file, and writes a grep-able CSV — after which every
+term you think of costs a `findstr`, not another hour.
+
+```
+v4ag.bat strings-map --image E:\evidence\WS01.raw
+...
+Probing WS01.strings (2.21 GB) offsets...
+  60,120,547 line(s); largest offset 24.9 GiB
+Attributing all 60,120,547 line(s) with windows.strings.Strings (engine library). The
+reverse map is built once — on a large image that is the slow part, tens of minutes to an hour.
+Wrote output\WS01\strings\strings-map.csv (13.882 GB) in 58 min
+Columns: String, Physical Address, Result (the owner, FREE MEMORY, or kernel). Grep it for
+any term now — no more map builds:
+  findstr /i "some.ioc" "output\WS01\strings\strings-map.csv"
+```
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `--image PATH` | *required* | The memory image |
+| `--strings-file PATH` | the one `strings` wrote | Any true-offset `offset:string` file |
+| `--force` | off | Attribute even a file whose offsets look wrapped; offsets used as written |
+| `--overwrite` | off | Replace an existing `strings-map.csv` |
+| `--pid PID` | all | Map only these processes — faster, other strings then show as `FREE MEMORY` |
+| `--out DIR` | `output\<image>` | Results directory |
+| `--engine`, `--symbols`, `--timeout` | as `triage` (timeout 4 h) | |
+
+Because it attributes the file in one pass, it does **no** per-line offset repair — so it
+needs a true-offset file, which is what `strings` writes (or GNU `strings -td`). A wrapped
+Sysinternals `-o` file is refused (exit code 5): its offsets would place every string past
+4 GiB on the wrong process. Regenerate with `strings`, or pass `--force` to attribute it
+exactly as written if you know the offsets are sound. The CSV is recorded in
+`strings-map.json` by size rather than digest — a whole-image run makes tens of millions of
+rows, and it is a derived, greppable artifact, not evidence.
+
+Expect the run to hold the reverse map (tens of GB) plus the whole strings file in memory at
+once; it is built for a host with the RAM to spare. When you have a defined IOC list rather
+than an open-ended hunt, one `strings-hits --terms-file` run gets you there without the giant
+CSV: it too builds the map only once, and attributes every term's hits in that single pass.
+
 ### `symbols` — report what symbols the image needs
 
 Use when you want the symbol answer without starting a run.

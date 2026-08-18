@@ -1354,6 +1354,135 @@ def cmd_strings_hits(args: argparse.Namespace) -> int:
     return code
 
 
+def cmd_strings_map(args: argparse.Namespace) -> int:
+    """Attribute a whole strings file at once, to a grep-able CSV, building the map once."""
+    from . import engine as engine_mod, manifest, scheduler, strings as strings_mod, triage
+
+    image = Path(args.image).expanduser()
+    if not image.is_file():
+        print(f"error: image not found: {image}", file=sys.stderr)
+        return 2
+
+    results_dir = _results_dir(args, image)
+    strings_dir = results_dir / "strings"
+    strings_file = (
+        Path(args.strings_file).expanduser() if args.strings_file
+        else _strings_file(image, strings_dir)
+    )
+    if not strings_file.is_file():
+        print(f"error: no strings file at {strings_file}", file=sys.stderr)
+        print("  Make one with 'v4ag strings --image ...', or point --strings-file at "
+              "one made by another tool.", file=sys.stderr)
+        return 2
+
+    output = strings_dir / "strings-map.csv"
+    if output.exists() and not args.overwrite:
+        print(f"error: {output} already exists "
+              f"({output.stat().st_size / 1e9:.2f} GB). Pass --overwrite to replace it.",
+              file=sys.stderr)
+        return 2
+
+    image_size = image.stat().st_size
+    print(f"Probing {strings_file.name} "
+          f"({strings_file.stat().st_size / 1e9:.2f} GB) offsets...")
+    probe = strings_mod.probe_offsets(strings_file)
+    if probe.max_offset < 0:
+        print("error: no offset:string lines found in this file; is it a strings file?",
+              file=sys.stderr)
+        return 2
+    print(f"  {probe.lines:,} line(s); largest offset {probe.max_offset / 2**30:.1f} GiB")
+
+    # Unlike strings-hits, this run does no per-line offset repair — it cannot, at
+    # whole-file scale — so a wrapped 32-bit strings file would attribute every
+    # string past 4 GiB to the wrong page. Refuse it: nothing here reaches 4 GiB
+    # though the image is larger, which is exactly what a Sysinternals -o file of a
+    # large image looks like. --force attributes it as written anyway.
+    if probe.max_offset < strings_mod.WRAP <= image_size and not args.force:
+        print(f"\nerror: no offset in this file reaches 4 GiB, although the image is "
+              f"{image_size / 2**30:.1f} GiB. This is what a Sysinternals 32-bit strings "
+              "file looks like; its offsets wrap, and attributing it whole would place "
+              "every string past 4 GiB on the wrong process.", file=sys.stderr)
+        print("  Regenerate the file with 'v4ag strings' (true offsets at any size), or "
+              "pass --force to attribute it exactly as written.", file=sys.stderr)
+        return 5
+
+    try:
+        engine = engine_mod.select(args.engine, BUNDLE_ROOT)
+    except (engine_mod.EngineUnavailable, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    symbols_dir = (
+        Path(args.symbols).expanduser() if args.symbols else default_symbols_dir()
+    )
+    cache_dir = BUNDLE_ROOT / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    strings_dir.mkdir(parents=True, exist_ok=True)
+
+    plugin_args = ["--strings-file", str(strings_file)]
+    if args.pid:
+        plugin_args += ["--pid", *[str(p) for p in args.pid]]
+
+    started = manifest.utc_now()
+    task = scheduler.Task(
+        key=strings_mod.PLUGIN,
+        label=strings_mod.PLUGIN,
+        command=engine.command(
+            image, strings_mod.PLUGIN, "csv",
+            symbols_dir=symbols_dir, cache_dir=cache_dir, plugin_args=plugin_args,
+        ),
+        stdout_path=output,
+        stderr_path=strings_dir / "logs" / "strings-map.csv.log",
+    )
+    print(f"\nAttributing all {probe.lines:,} line(s) with {strings_mod.PLUGIN} "
+          f"(engine {engine.name}). The reverse map is built once — on a large image "
+          "that is the slow part, tens of minutes to an hour.")
+    result = scheduler.run_tasks([task], jobs=1, timeout=args.timeout)[0]
+
+    record: dict = {
+        "tool": "v4ag strings-map",
+        "version": __version__,
+        "image": str(image),
+        "image_size": image_size,
+        "strings_file": str(strings_file),
+        "strings_file_size": strings_file.stat().st_size,
+        "lines": probe.lines,
+        "max_offset": probe.max_offset,
+        "offsets": "forced" if args.force else "structural",
+        "pids": args.pid or None,
+        "output": output.name,
+        "status": result.status,
+        "seconds": round(result.duration, 1),
+        "log": str(task.stderr_path.relative_to(strings_dir)),
+        "started_utc": started,
+        "finished_utc": manifest.utc_now(),
+    }
+
+    code = 0
+    if result.ok:
+        # The CSV is huge and written by the subprocess, so it is recorded by size,
+        # not hashed: a whole-image run makes tens of millions of rows, and reading
+        # them all back to hash would add minutes for little custody value on a
+        # derived, greppable artifact.
+        size = output.stat().st_size if output.exists() else 0
+        record["output_size"] = size
+        print(f"\nWrote {output} ({size / 1e9:.2f} GB) in {result.duration / 60:.0f} min")
+        print("Columns: String, Physical Address, Result (the owner, FREE MEMORY, or "
+              "kernel). Grep it for any term now — no more map builds:")
+        print(f'  findstr /i "some.ioc" "{output}"')
+    else:
+        print(f"\nFAIL {result.status}")
+        diagnosis = triage.failure_diagnosis(result)
+        if diagnosis:
+            for line in diagnosis.splitlines():
+                print(f"    {line}")
+        print(f"  Log {task.stderr_path}")
+        code = 1
+
+    manifest_path = manifest.write(strings_dir, record, filename="strings-map.json")
+    print(f"Record {manifest_path}")
+    return code
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Report the bundle's health. Written for a host with no debugger and no network."""
     import platform
@@ -1423,8 +1552,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 #: Listed by doctor so a stale extract is obvious at a glance.
 _COMMANDS = (
-    "triage", "analyze", "strings", "strings-hits", "symbols", "fetch-symbols",
-    "verify", "doctor", "check",
+    "triage", "analyze", "strings", "strings-hits", "strings-map", "symbols",
+    "fetch-symbols", "verify", "doctor", "check",
 )
 
 
@@ -1622,6 +1751,50 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout", type=float, default=3600.0, help="plugin timeout in seconds"
     )
     hits.set_defaults(func=cmd_strings_hits)
+
+    strings_map = sub.add_parser(
+        "strings-map",
+        help="attribute a whole strings file at once to a grep-able CSV",
+        description=(
+            "Runs windows.strings.Strings over the entire strings file in one pass "
+            "and writes <out>\\strings\\strings-map.csv (columns String, Physical "
+            "Address, Result). The reverse map that says which process, kernel region "
+            "or free page holds each string is built once, so a hundred later greps "
+            "cost nothing — where 'strings-hits' rebuilds it per search. The whole-file "
+            "run does no offset repair, so it needs a true-offset file: this tool's "
+            "'strings' output, or GNU 'strings -td'. A wrapped Sysinternals file is "
+            "refused unless --force, because its offsets would misattribute everything "
+            "past 4 GiB."
+        ),
+    )
+    strings_map.add_argument("--image", required=True, help="path to the memory image")
+    strings_map.add_argument(
+        "--strings-file", default=None,
+        help="the strings file to attribute (default: the one 'strings' wrote for this image)",
+    )
+    strings_map.add_argument(
+        "--out", default=None, help="results directory (default: output\\<image>)"
+    )
+    strings_map.add_argument(
+        "--force", action="store_true",
+        help="attribute even a file whose offsets look wrapped (32-bit); offsets used as written",
+    )
+    strings_map.add_argument(
+        "--overwrite", action="store_true", help="replace an existing strings-map.csv"
+    )
+    strings_map.add_argument(
+        "--pid", action="append", type=int, default=None, metavar="PID",
+        help="map only these processes (faster; other strings then show as FREE MEMORY)",
+    )
+    strings_map.add_argument("--symbols", default=None, help="symbols directory")
+    strings_map.add_argument(
+        "--engine", default="auto", choices=["auto", "library", "exe"],
+        help="which Volatility to drive (default: auto)",
+    )
+    strings_map.add_argument(
+        "--timeout", type=float, default=14400.0, help="plugin timeout in seconds"
+    )
+    strings_map.set_defaults(func=cmd_strings_map)
 
     symbols = sub.add_parser(
         "symbols", help="identify the kernel and report the symbols needed"

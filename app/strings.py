@@ -483,6 +483,67 @@ def scan_hits(
     )
 
 
+@dataclass
+class OffsetProbe:
+    """A cheap read of a strings file's offset structure — enough to tell a
+    true-offset file from a wrapped 32-bit one without touching the image."""
+
+    lines: int
+    max_offset: int
+
+
+_WHITESPACE = frozenset(b" \t\n\r\x0b\x0c")
+
+
+def _leading_offset(line: bytes) -> int | None:
+    """The decimal offset a line begins with, or None — parse_line's view of it.
+
+    Matches ``\\s*(\\d+)`` (leading whitespace, then the offset) but reads only
+    the number, for a probe that visits every one of tens of millions of lines
+    and needs none of the string.
+    """
+    i, n = 0, len(line)
+    while i < n and line[i] in _WHITESPACE:
+        i += 1
+    j = i
+    while j < n and 0x30 <= line[j] <= 0x39:
+        j += 1
+    return int(line[i:j]) if j > i else None
+
+
+def probe_offsets(path: Path, *, block_size: int = 16 << 20) -> OffsetProbe:
+    """Stream a strings file and report its line count and largest offset.
+
+    Reads every line's offset — cheap next to the reverse-map build it guards —
+    so the largest is exact wherever it sits, not merely sampled. That is what
+    ``strings-map`` needs before it trusts a whole file's offsets unrepaired: a
+    true-offset file of a large image climbs past 4 GiB, a wrapped 32-bit one
+    never does. Handles a BOM/UTF-16 file the way ``scan_hits`` does.
+    """
+    lines = 0
+    max_offset = -1
+    with open(path, "rb") as handle:
+        carry = b""
+        for block in _blocks(handle, block_size):
+            data = carry + block
+            cut = data.rfind(b"\n")
+            if cut < 0:
+                carry = data
+                continue
+            body, carry = data[: cut + 1], data[cut + 1 :]
+            lines += body.count(b"\n")
+            for line in body.split(b"\n"):
+                offset = _leading_offset(line)
+                if offset is not None and offset > max_offset:
+                    max_offset = offset
+        if carry:
+            lines += 1
+            offset = _leading_offset(carry)
+            if offset is not None and offset > max_offset:
+                max_offset = offset
+    return OffsetProbe(lines=lines, max_offset=max_offset)
+
+
 def _widen(probe: bytes) -> bytes:
     try:
         return probe.decode("utf-8").encode("utf-16-le")
