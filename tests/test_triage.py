@@ -455,6 +455,59 @@ class TestPluginNeedsAnArgument:
         (record,) = triage.plugin_records([outcome])
         assert record["diagnosis"] is None
 
+    def test_two_missing_options_read_as_a_pair(self, tmp_path) -> None:
+        """pe_symbols wants --source and --module; seen on a real --all run."""
+        result = self._result(
+            tmp_path,
+            "volrunner.py windows.pe_symbols.PESymbols: error: the following "
+            "arguments are required: --source, --module\n",
+        )
+        diagnosis = triage.failure_diagnosis(result)
+        assert "needs --source and --module" in diagnosis
+        assert "those arguments" in diagnosis
+
+    def test_yara_without_rules_is_a_missing_argument(self, tmp_path) -> None:
+        """vadyarascan's rule options are all optional to argparse, so it
+        starts, logs the lack, and dies with a ValueError. Seen on a real
+        --all run: the last line alone was accurate but handed nothing back."""
+        text = (
+            "ERROR    volatility3.plugins.yarascan: No yara rules, nor yara rules "
+            "file were specified\n"
+            "Traceback (most recent call last):\n"
+            '  File ".../yarascan.py", line 46, in __init__\n'
+            '    raise ValueError("No rules provided to YaraScanner")\n'
+            "ValueError: No rules provided to YaraScanner\n"
+        )
+        result = self._result(
+            tmp_path, text, returncode=1,
+            command=["vol", "windows.vadyarascan.VadYaraScan"],
+        )
+        outcome = triage.PluginOutcome("windows.vadyarascan.VadYaraScan",
+                                       results={"json": result})
+        note = triage.failure_note(outcome)
+
+        assert "needs --yara-file" in note
+        assert 'windows.vadyarascan.VadYaraScan --yara-file "<YARA_FILE>"' in note
+
+    def test_crashinfo_on_a_non_dump_is_named_not_quoted(self, tmp_path) -> None:
+        """crashinfo logs the real reason and then does a bare `raise`, so the
+        last line is "RuntimeError: No active exception to reraise" — which
+        quoted on its own reads as a bug in the plugin."""
+        text = (
+            "ERROR    volatility3.plugins.windows.crashinfo: This plugin requires "
+            "a Windows crash dump\n"
+            "Traceback (most recent call last):\n"
+            '  File ".../crashinfo.py", line 86, in run\n'
+            "    raise\n"
+            "RuntimeError: No active exception to reraise\n"
+        )
+        result = self._result(tmp_path, text, returncode=1)
+        diagnosis = triage.failure_diagnosis(result)
+
+        assert "crash dump" in diagnosis
+        assert "not a fault" in diagnosis
+        assert "No active exception" not in diagnosis
+
 
 class TestProbeLogIsKept:
     """The probe log is the only record of why a probe failed.

@@ -175,6 +175,25 @@ _KNOWN_CAUSES: tuple[tuple[str, str], ...] = (
         "The VMSS/VMSN beside this VMEM could not be parsed. It may be truncated, or\n"
         "  may belong to a different snapshot than the VMEM.",
     ),
+    # crashinfo logs this and then does a bare `raise`, so the last line of its
+    # log is "RuntimeError: No active exception to reraise" — which quoted on
+    # its own reads as a bug rather than the plain fact that this image is not
+    # a crash dump.
+    (
+        "this plugin requires a windows crash dump",
+        "reads the header of a Windows crash dump (.dmp) only. This image is not "
+        "one, so there is nothing for it to report; not a fault.",
+    ),
+)
+
+#: Plugins whose options are all optional to argparse but which cannot run
+#: without one of them, so they start, log this, and fall over. Each entry maps
+#: the log fragment to the option to suggest — the same fix as an argparse
+#: refusal, reached by a different route.
+_ARGUMENT_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # vadyarascan / yarascan: --yara-file, --yara-string or --yara-compiled-file
+    # would each do; the file is the one an analyst usually has.
+    ("no yara rules, nor yara rules file were specified", ("--yara-file",)),
 )
 
 
@@ -225,6 +244,13 @@ def missing_arguments(log_text: str) -> list[str]:
             flag = "--" + parts[-1].replace("_", "-")
             if flag not in found:
                 found.append(flag)
+    if found:
+        return found
+
+    lowered = log_text.lower()
+    for needle, flags in _ARGUMENT_HINTS:
+        if needle in lowered:
+            found.extend(f for f in flags if f not in found)
     return found
 
 
@@ -256,10 +282,11 @@ def failure_diagnosis(result: scheduler.TaskResult) -> str:
     # an unidentifiable image and send the analyst back to the evidence.
     missing = missing_arguments(text)
     if missing:
-        flags = ", ".join(missing)
+        flags = " and ".join(missing) if len(missing) == 2 else ", ".join(missing)
+        those = "those arguments" if len(missing) > 1 else "that argument"
         return (
             f"needs {flags}, which triage does not pass. The plugin takes an "
-            f"input of its own; run it by hand with that argument."
+            f"input of its own; run it by hand with {those}."
         )
 
     lowered = detail.lower()
