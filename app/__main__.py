@@ -1079,7 +1079,8 @@ def cmd_strings(args: argparse.Namespace) -> int:
     print(f"\nWrote {output} ({output.stat().st_size / 1e9:.2f} GB): "
           f"{result.strings:,} strings ({result.ascii:,} ascii, {result.unicode:,} unicode) "
           f"in {minutes}m{seconds:02d}s")
-    print(f"Next: v4ag strings-hits --image \"{image}\" --term TEXT [--term TEXT ...]"
+    print(f"Next: v4ag strings-hits --image \"{image}\" --strings-file \"{output}\" "
+          f"--term TEXT [--term TEXT ...]"
           + (f" --out \"{args.out}\"" if args.out else ""))
     return 0
 
