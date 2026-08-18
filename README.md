@@ -26,6 +26,8 @@ What has to be true before a production release candidate is set out in
 | --- | --- |
 | `triage` | runs the plugin set against an image and writes one file per plugin per format |
 | `analyze` | correlates a finished run into findings, and collects the follow-up evidence |
+| `strings` | writes every string in the image with its true offset, for `windows.strings` |
+| `strings-hits` | searches a strings file for your terms, corrects wrapped offsets, and asks the plugin who holds each hit |
 | `symbols` | identifies the kernel, reports URLs, writes `symbol_request.json` |
 | `fetch-symbols` | downloads and converts symbols on the connected side |
 | `verify` | checks a request is satisfied before you walk back |

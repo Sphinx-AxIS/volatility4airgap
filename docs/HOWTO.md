@@ -199,6 +199,100 @@ hiding, kernel modules missing from the loaded list, SSDT hooks, unbacked driver
 services that are hidden, run from a user-writable path, or are hosted by a process with
 injected code in it.
 
+### `strings` — write every string in the image, with its true offset
+
+`windows.strings.Strings` does one thing no other plugin does: given a strings file it
+says which process, kernel region or free page each string sits in. It does not make the
+strings file; this command does.
+
+```bat
+v4ag.bat strings --image E:\evidence\WS01.raw
+```
+
+Writes `output\WS01\strings\WS01.strings` — one `offset:string` line per string, ASCII and
+UTF-16, decimal offsets — and a small `.json` beside it recording how it was made. On a
+25 GB image expect several minutes and a file of a few gigabytes; progress is printed as
+it goes.
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `--image PATH` | *required* | The memory image |
+| `--out DIR` | `output\<image>` | Results directory; the file goes in its `strings\` folder |
+| `--min-length N` | `4` | Shortest string to keep, in characters |
+| `--encoding NAME` | `both` | `ascii`, `unicode` (UTF-16LE), or `both` |
+| `--overwrite` | off | Replace an existing strings file |
+
+**Why not Sysinternals `strings.exe`?** You can — `strings-hits` reads its output too —
+but on an image over 4 GiB its `-o` offsets are 32-bit and wrap: a string at 27 GB is
+reported at 27 GB minus six times 4 GiB. That is not an error the plugin can see. The
+wrapped offset lands on a real page in the low 4 GiB, owned by some real process, and the
+string is attributed to that process with nothing to say it is wrong. This command's
+offsets are exact at any size, and `strings-hits` detects and corrects the wrapped kind
+if that is what you have.
+
+### `strings-hits` — who holds each string you care about
+
+The plugin loads its entire input into memory and emits a row for every line, so it is
+never fed a whole strings file. This searches one for your terms, checks each hit against
+the image, and runs the plugin on just those lines:
+
+```bat
+v4ag.bat strings-hits --image E:\evidence\WS01.raw --term evil.example.com --term "net use Z:"
+```
+
+```
+Searching WS01.strings (2.06 GB) for 2 term(s)...
+  71,203,455 line(s); 212 matched
+Checking each hit against WS01.raw...
+  178 hit(s) are not where their offsets say, but exactly a multiple of 4 GiB further on: the file has 32-bit offsets,
+  as Sysinternals strings.exe writes them. Using where the bytes actually are.
+  31 hit(s) at their stated offset
+  3 hit(s) not in the image at any candidate offset; kept out of the plugin's input, listed in strings-hits-unresolved.txt
+Wrote output\WS01\strings\strings-hits.txt (215 line(s))
+
+Running windows.strings.Strings on 215 line(s) (engine library; the reverse map takes a while on a large image)...
+  ok (312.4s)
+
+Process 4180 powershell.exe  (58 hits)
+       0x61b2c3d4e  HostApplication=C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe ...
+  ...
+FREE MEMORY  (120 hits)
+  ...
+```
+
+Every hit is verified by reading the image at its offset — and, when the image is over
+4 GiB, at each offset a 32-bit wrap could have folded onto it. A hit found only at such a
+folded offset is the signature of a Sysinternals file, and the true offsets are used. A
+hit found nowhere is kept out of the plugin's input rather than mis-attributed, and listed
+so you can search for it by hand. If *no* hit is in the image at all, the strings file is
+for some other image, and the command stops (exit code 5).
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `--image PATH` | *required* | The memory image |
+| `--term TEXT` | | Text to look for, case-insensitive; repeat for several |
+| `--terms-file FILE` | | Terms one per line; `#` starts a comment |
+| `--strings-file PATH` | the one `strings` wrote | Any `offset:string` file — this tool's, Sysinternals', or GNU `strings -td` |
+| `--case-sensitive` | off | Match case |
+| `--max-hits N` | `50000` | Stop if more lines than this match; the terms are too broad |
+| `--trust-offsets` | off | Skip the check; pass the file's offsets through as they are |
+| `--pid PID` | all | Map only these processes — faster, but other hits then show as `FREE MEMORY` |
+| `--no-run` | off | Write the hits file and stop |
+| `--out DIR` | `output\<image>` | Results directory |
+| `--engine`, `--symbols`, `--timeout` | as `triage` | |
+
+Output lands in `output\<image>\strings\`: `strings-hits.txt` (what the plugin was given),
+`windows.strings.Strings.json` (its full table), `strings-hits-report.txt` (the table by
+owner, as printed), `strings-hits.json` (terms, counts, what was relocated, digests), and
+`logs\`. If the folder also holds a triage run, process names from its `pslist` output are
+shown beside the PIDs.
+
+Two things worth knowing about the plugin itself. It works in physical addresses, which is
+why this only makes sense for a raw image where file offset and physical address are the
+same thing. And it maps every process's whole address space before it answers, so on a
+large image the run is minutes even for a handful of lines — `--pid` narrows that when
+you already know whose memory you are asking about.
+
 ### `symbols` — report what symbols the image needs
 
 Use when you want the symbol answer without starting a run.
@@ -384,6 +478,21 @@ output\<image name>\
    └─ PID-7224\
 ```
 
+After `strings` and `strings-hits`:
+
+```
+output\<image name>\
+└─ strings\
+   ├─ <image name>.strings       every string, offset:string — gigabytes
+   ├─ <image name>.strings.json  how it was made
+   ├─ strings-hits.txt           the lines the plugin was given, offsets verified
+   ├─ strings-hits-unresolved.txt  hits found nowhere in the image, if any
+   ├─ strings-hits-report.txt    the plugin's answer, by owner
+   ├─ strings-hits.json          terms, counts, relocations, digests
+   ├─ windows.strings.Strings.json
+   └─ logs\
+```
+
 `findings.json` records, for each finding, the rule that produced it, the digest of the
 rule pack in force, and the plugin rows that triggered it. It also lists the rules that
 could *not* be evaluated because a plugin they need failed during triage — so an empty
@@ -417,7 +526,7 @@ diagnostic is lost. If a plugin you expected is absent from the output folder, c
 | `2` | Bad input | Fix the path or option named in the error |
 | `3` | Symbols missing | Run `fetch-symbols` on a connected machine |
 | `4` | Probe failed | Read the diagnosis; `--force` to run anyway |
-| `5` | `analyze` evidence does not match the triage run | Supply the image and pagefile that were triaged |
+| `5` | Evidence does not match: `analyze` given a different image or pagefile than the triage run; `strings-hits` given a strings file none of whose hits is in the image | Supply the image and pagefile that were triaged; check the strings file is this image's |
 | `6` | Plugin output does not match `run-manifest.json` | Re-run triage, or `--allow-modified-input` |
 
 Useful in a batch file:
@@ -531,12 +640,14 @@ plugin returns zero rows.
 
 **A plugin fails with `needs --something, which triage does not pass`**
 Nothing is missing from the bundle. Some plugins take an input of their own —
-`windows.strings.Strings` wants a `--strings-file` produced beforehand by the `strings`
-utility, `windows.vadregexscan.VadRegExScan` wants a `--pattern` — and Volatility refuses
+`windows.strings.Strings` wants a `--strings-file` produced beforehand,
+`windows.vadregexscan.VadRegExScan` wants a `--pattern` — and Volatility refuses
 to start them without it. Triage passes no per-plugin arguments, which is why none of these is in
 the curated set; you meet them under `--all` or by naming one. The failure line prints
 the exact command to run it by hand with a placeholder for the missing argument, and
-`run-manifest.json` records the same under `diagnosis`.
+`run-manifest.json` records the same under `diagnosis`. For `windows.strings.Strings`
+specifically, the `strings` and `strings-hits` commands are the intended route: they make
+the input, cut it down to the lines that matter, and run the plugin for you.
 
 **Everything fails after copying symbols across**
 Check the folder landed in the right place. The tool expects

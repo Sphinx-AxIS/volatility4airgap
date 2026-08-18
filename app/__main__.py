@@ -987,6 +987,320 @@ def _probe(name: str) -> tuple[bool, str]:
     return True, str(version)
 
 
+def _results_dir(args: argparse.Namespace, image: Path) -> Path:
+    """The same default `triage` uses, so everything about one image lands together."""
+    return Path(args.out).expanduser() if args.out else BUNDLE_ROOT / "output" / image.stem
+
+
+def _strings_file(image: Path, strings_dir: Path) -> Path:
+    return strings_dir / f"{image.stem}.strings"
+
+
+def cmd_strings(args: argparse.Namespace) -> int:
+    """Write every string in the image, with its true offset, for windows.strings."""
+    import time
+
+    from . import manifest, strings as strings_mod
+
+    image = Path(args.image).expanduser()
+    if not image.is_file():
+        print(f"error: image not found: {image}", file=sys.stderr)
+        return 2
+    if args.min_length < 1:
+        print("error: --min-length must be at least 1", file=sys.stderr)
+        return 2
+
+    encodings = {
+        "both": strings_mod.ENCODINGS, "ascii": ("ascii",), "unicode": ("unicode",),
+    }[args.encoding]
+
+    strings_dir = _results_dir(args, image) / "strings"
+    output = _strings_file(image, strings_dir)
+    if output.exists() and not args.overwrite:
+        print(f"error: {output} already exists "
+              f"({output.stat().st_size / 1e9:.2f} GB). Pass --overwrite to replace it.",
+              file=sys.stderr)
+        return 2
+    strings_dir.mkdir(parents=True, exist_ok=True)
+
+    size = image.stat().st_size
+    print(f"Scanning {image.name} ({size / 1e9:.2f} GB) for strings of "
+          f"{args.min_length}+ characters, {args.encoding}...")
+    print(f"Output {output}")
+
+    started = manifest.utc_now()
+    clock = time.monotonic()
+    shown = {"pct": 0}
+
+    def progress(done: int, total: int, count: int) -> None:
+        pct = done * 100 // max(total, 1)
+        if pct < shown["pct"] + 10 and done < total:
+            return
+        shown["pct"] = pct - pct % 10
+        elapsed = time.monotonic() - clock
+        rate = done / elapsed / 1e6 if elapsed else 0.0
+        remaining = (total - done) / (done / elapsed) if done and elapsed else 0.0
+        print(f"  {done / 1e9:6.1f} of {total / 1e9:.1f} GB  {pct:3d}%  "
+              f"{rate:5.0f} MB/s  {count:>12,} strings  ~{remaining / 60:.0f} min left",
+              flush=True)
+
+    result = strings_mod.extract(
+        image, output, min_length=args.min_length, encodings=encodings, progress=progress
+    )
+
+    sidecar = output.with_name(output.name + ".json")
+    manifest.write(
+        strings_dir,
+        {
+            "tool": "v4ag strings",
+            "version": __version__,
+            "image": str(image),
+            "strings_file": output.name,
+            "started_utc": started,
+            "finished_utc": manifest.utc_now(),
+            **result.as_dict(),
+        },
+        filename=sidecar.name,
+    )
+
+    minutes, seconds = divmod(int(result.seconds), 60)
+    print(f"\nWrote {output} ({output.stat().st_size / 1e9:.2f} GB): "
+          f"{result.strings:,} strings ({result.ascii:,} ascii, {result.unicode:,} unicode) "
+          f"in {minutes}m{seconds:02d}s")
+    print(f"Next: v4ag strings-hits --image \"{image}\" --term TEXT [--term TEXT ...]"
+          + (f" --out \"{args.out}\"" if args.out else ""))
+    return 0
+
+
+def _read_terms(args: argparse.Namespace) -> list[str]:
+    terms = [t for t in (args.term or []) if t]
+    if args.terms_file:
+        path = Path(args.terms_file).expanduser()
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if line and not line.startswith("#"):
+                terms.append(line)
+    return terms
+
+
+def cmd_strings_hits(args: argparse.Namespace) -> int:
+    """Search a strings file, put its offsets right, and ask the plugin who holds each hit."""
+    from . import (
+        analysis as analysis_mod,
+        engine as engine_mod,
+        manifest,
+        scheduler,
+        strings as strings_mod,
+        triage,
+    )
+
+    image = Path(args.image).expanduser()
+    if not image.is_file():
+        print(f"error: image not found: {image}", file=sys.stderr)
+        return 2
+
+    results_dir = _results_dir(args, image)
+    strings_dir = results_dir / "strings"
+    strings_file = (
+        Path(args.strings_file).expanduser() if args.strings_file
+        else _strings_file(image, strings_dir)
+    )
+    if not strings_file.is_file():
+        print(f"error: no strings file at {strings_file}", file=sys.stderr)
+        print("  Make one with 'v4ag strings --image ...', or point --strings-file at "
+              "one made by another tool.", file=sys.stderr)
+        return 2
+
+    try:
+        terms = _read_terms(args)
+    except OSError as exc:
+        print(f"error: cannot read terms: {exc}", file=sys.stderr)
+        return 2
+    if not terms:
+        print("error: no search terms. Give --term TEXT (repeat for several) or "
+              "--terms-file FILE, one per line.", file=sys.stderr)
+        return 2
+    if args.max_hits < 1:
+        print("error: --max-hits must be at least 1", file=sys.stderr)
+        return 2
+
+    strings_dir.mkdir(parents=True, exist_ok=True)
+    started = manifest.utc_now()
+
+    print(f"Searching {strings_file.name} ({strings_file.stat().st_size / 1e9:.2f} GB) "
+          f"for {len(terms)} term(s)...")
+    scan = strings_mod.scan_hits(
+        strings_file, terms, ignore_case=not args.case_sensitive, max_hits=args.max_hits,
+    )
+    detail = f", {scan.unparsed} unparseable" if scan.unparsed else ""
+    print(f"  {scan.lines:,} line(s); {len(scan.hits):,} matched{detail}")
+    if scan.truncated:
+        print(f"\nerror: stopped at {args.max_hits:,} hits. Terms this broad would give "
+              "the plugin more than it can usefully attribute; narrow them, or raise "
+              "--max-hits.", file=sys.stderr)
+        return 2
+    if not scan.hits:
+        print("No line matched. Nothing to run.")
+        return 0
+
+    image_size = image.stat().st_size
+    location = None
+    if args.trust_offsets:
+        print("  offsets taken as written (--trust-offsets)")
+        lines = strings_mod.plugin_lines(scan.hits, wrapped=False, trust=True)
+    else:
+        print(f"Checking each hit against {image.name}...")
+        location = strings_mod.locate(image, scan.hits)
+        if location.wrapped:
+            print(f"  {location.relocated} hit(s) are not where their offsets say, but "
+                  "exactly a multiple of 4 GiB further on: the file has 32-bit offsets,")
+            print("  as Sysinternals strings.exe writes them. Using where the bytes "
+                  "actually are.")
+        if location.at_stated:
+            print(f"  {location.at_stated} hit(s) at their stated offset")
+        if location.unresolved:
+            print(f"  {location.unresolved} hit(s) not in the image at any candidate "
+                  "offset; kept out of the plugin's input, listed in "
+                  "strings-hits-unresolved.txt")
+        if scan.max_offset < strings_mod.WRAP <= image_size:
+            print(f"  (no offset in the file exceeds 4 GiB although the image is "
+                  f"{image_size / 2**30:.1f} GiB; the sequence restarts {scan.drops} time(s))")
+        if not location.at_stated and not location.relocated:
+            print("\nerror: none of the hits is in this image at its offset or at any "
+                  "4 GiB multiple of it. Is this the strings file for this image?",
+                  file=sys.stderr)
+            return 5
+        lines = strings_mod.plugin_lines(scan.hits, wrapped=location.wrapped)
+
+    hits_path = strings_dir / "strings-hits.txt"
+    hits_path.write_bytes(b"".join(lines))
+    unresolved_path = strings_dir / "strings-hits-unresolved.txt"
+    unresolved = strings_mod.unresolved_lines(scan.hits) if location is not None else []
+    if unresolved:
+        unresolved_path.write_bytes(b"".join(unresolved))
+    elif unresolved_path.exists():
+        unresolved_path.unlink()
+    print(f"Wrote {hits_path} ({len(lines)} line(s))")
+
+    record: dict = {
+        "tool": "v4ag strings-hits",
+        "version": __version__,
+        "image": str(image),
+        "image_size": image_size,
+        "strings_file": str(strings_file),
+        "strings_file_size": scan.size,
+        "terms": terms,
+        "ignore_case": not args.case_sensitive,
+        "lines_searched": scan.lines,
+        "hits": len(scan.hits),
+        "offsets": (
+            "trusted" if location is None
+            else "wrapped, relocated" if location.wrapped
+            else "exact"
+        ),
+        "at_stated_offset": None if location is None else location.at_stated,
+        "relocated": None if location is None else location.relocated,
+        "unresolved": len(unresolved),
+        "plugin_input": {
+            "file": hits_path.name,
+            "lines": len(lines),
+            "sha256": manifest.sha256_file(hits_path),
+        },
+        "started_utc": started,
+    }
+
+    code = 0
+    if not args.no_run:
+        try:
+            engine = engine_mod.select(args.engine, BUNDLE_ROOT)
+        except (engine_mod.EngineUnavailable, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        symbols_dir = (
+            Path(args.symbols).expanduser() if args.symbols else default_symbols_dir()
+        )
+        cache_dir = BUNDLE_ROOT / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # The plugin's own arguments come last, --pid last of all: it takes
+        # nargs='+' and would swallow anything after it.
+        plugin_args = ["--strings-file", str(hits_path)]
+        if args.pid:
+            plugin_args += ["--pid", *[str(p) for p in args.pid]]
+
+        task = scheduler.Task(
+            key=strings_mod.PLUGIN,
+            label=strings_mod.PLUGIN,
+            command=engine.command(
+                image, strings_mod.PLUGIN, "json",
+                symbols_dir=symbols_dir, cache_dir=cache_dir, plugin_args=plugin_args,
+            ),
+            stdout_path=strings_dir / f"{strings_mod.PLUGIN}.json",
+            stderr_path=strings_dir / "logs" / f"{strings_mod.PLUGIN}.json.log",
+        )
+        print(f"\nRunning {strings_mod.PLUGIN} on {len(lines)} line(s) "
+              f"(engine {engine.name}; the reverse map takes a while on a large image)...")
+        result = scheduler.run_tasks([task], jobs=1, timeout=args.timeout)[0]
+        record["plugin"] = {
+            "name": strings_mod.PLUGIN,
+            "command": engine_mod.render_command(task.command),
+            "status": result.status,
+            "seconds": round(result.duration, 1),
+            "output": task.stdout_path.name,
+            "log": str(task.stderr_path.relative_to(strings_dir)),
+        }
+        if result.ok:
+            print(f"  ok ({result.duration:.1f}s)")
+            rows = analysis_mod.load_rows(task.stdout_path)
+            record["plugin"]["rows"] = len(rows)
+            record["plugin"]["sha256"] = manifest.sha256_file(task.stdout_path)
+
+            names: dict[int, str] = {}
+            pslist = analysis_mod.output_json_path(results_dir, "windows.pslist.PsList")
+            if pslist.is_file():
+                try:
+                    names = strings_mod.process_names(analysis_mod.load_rows(pslist))
+                except ValueError:
+                    names = {}
+
+            groups = strings_mod.group_rows(rows, names)
+            print()
+            for line in strings_mod.report_lines(groups, width=100, per_group=8):
+                print(strings_mod.console_safe(line))
+
+            report_path = strings_dir / "strings-hits-report.txt"
+            header = [
+                f"windows.strings.Strings over {len(lines)} line(s) matching "
+                f"{len(terms)} term(s): {', '.join(terms)}",
+                f"image {image}",
+                f"strings file {strings_file}",
+                f"run {record['started_utc']}",
+                "",
+            ]
+            report_path.write_text(
+                "\n".join(header + strings_mod.report_lines(groups)) + "\n", encoding="utf-8"
+            )
+            record["report"] = {
+                "file": report_path.name,
+                "sha256": manifest.sha256_file(report_path),
+            }
+            print(f"\nReport {report_path}")
+            print(f"Table  {task.stdout_path}")
+        else:
+            print(f"  FAIL {result.status}")
+            diagnosis = triage.failure_diagnosis(result)
+            if diagnosis:
+                for line in diagnosis.splitlines():
+                    print(f"    {line}")
+            print(f"  Log {task.stderr_path}")
+            code = 1
+
+    record["finished_utc"] = manifest.utc_now()
+    manifest_path = manifest.write(strings_dir, record, filename="strings-hits.json")
+    print(f"Record {manifest_path}")
+    return code
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Report the bundle's health. Written for a host with no debugger and no network."""
     import platform
@@ -1056,7 +1370,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 #: Listed by doctor so a stale extract is obvious at a glance.
 _COMMANDS = (
-    "triage", "analyze", "symbols", "fetch-symbols", "verify", "doctor", "check"
+    "triage", "analyze", "strings", "strings-hits", "symbols", "fetch-symbols",
+    "verify", "doctor", "check",
 )
 
 
@@ -1169,6 +1484,91 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip checking the image and pagefiles against the triage manifest",
     )
     analyze.set_defaults(func=cmd_analyze)
+
+    strings_cmd = sub.add_parser(
+        "strings",
+        help="write every string in the image, with true offsets, for windows.strings",
+        description=(
+            "Walks the image once and writes offset:string lines to "
+            "<out>\\strings\\<image>.strings — the file windows.strings.Strings takes "
+            "as --strings-file. Offsets are exact at any image size, which is the "
+            "point: Sysinternals strings.exe prints 32-bit offsets, and on an image "
+            "over 4 GiB those wrap and the plugin attributes strings to the wrong "
+            "process without any sign of it."
+        ),
+    )
+    strings_cmd.add_argument("--image", required=True, help="path to the memory image")
+    strings_cmd.add_argument(
+        "--out", default=None, help="results directory (default: output\\<image>)"
+    )
+    strings_cmd.add_argument(
+        "--min-length", type=int, default=4, metavar="N",
+        help="shortest string to keep, in characters (default: 4)",
+    )
+    strings_cmd.add_argument(
+        "--encoding", default="both", choices=["both", "ascii", "unicode"],
+        help="ASCII, UTF-16LE, or both (default: both)",
+    )
+    strings_cmd.add_argument(
+        "--overwrite", action="store_true", help="replace an existing strings file"
+    )
+    strings_cmd.set_defaults(func=cmd_strings)
+
+    hits = sub.add_parser(
+        "strings-hits",
+        help="search a strings file for terms and ask windows.strings who holds each hit",
+        description=(
+            "Searches a strings file for your terms, checks every hit against the "
+            "image — which finds and corrects the wrapped 32-bit offsets a "
+            "Sysinternals strings file has on a large image — writes the plugin-ready "
+            "hits to <out>\\strings\\strings-hits.txt, and runs "
+            "windows.strings.Strings on it to say which process, kernel region or "
+            "free page each hit is in."
+        ),
+    )
+    hits.add_argument("--image", required=True, help="path to the memory image")
+    hits.add_argument(
+        "--strings-file", default=None,
+        help="the strings file to search (default: the one 'strings' wrote for this image)",
+    )
+    hits.add_argument(
+        "--term", action="append", default=None, metavar="TEXT",
+        help="text to look for; repeat for several",
+    )
+    hits.add_argument(
+        "--terms-file", default=None, metavar="FILE",
+        help="a file of terms, one per line; # starts a comment",
+    )
+    hits.add_argument(
+        "--case-sensitive", action="store_true", help="match case (default: ignore it)"
+    )
+    hits.add_argument(
+        "--max-hits", type=int, default=50000, metavar="N",
+        help="stop if more lines than this match (default: 50000)",
+    )
+    hits.add_argument(
+        "--trust-offsets", action="store_true",
+        help="do not check the hits against the image; pass the file's offsets through",
+    )
+    hits.add_argument(
+        "--out", default=None, help="results directory (default: output\\<image>)"
+    )
+    hits.add_argument(
+        "--no-run", action="store_true", help="write the hits file but do not run the plugin"
+    )
+    hits.add_argument(
+        "--pid", action="append", type=int, default=None, metavar="PID",
+        help="map only these processes (faster; other hits then show as FREE MEMORY)",
+    )
+    hits.add_argument("--symbols", default=None, help="symbols directory")
+    hits.add_argument(
+        "--engine", default="auto", choices=["auto", "library", "exe"],
+        help="which Volatility to drive (default: auto)",
+    )
+    hits.add_argument(
+        "--timeout", type=float, default=3600.0, help="plugin timeout in seconds"
+    )
+    hits.set_defaults(func=cmd_strings_hits)
 
     symbols = sub.add_parser(
         "symbols", help="identify the kernel and report the symbols needed"
