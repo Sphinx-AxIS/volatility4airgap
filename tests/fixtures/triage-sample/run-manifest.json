@@ -48,8 +48,8 @@
     },
     {
       "file": "windows.malware.ldrmodules.LdrModules.json",
-      "size_bytes": 624,
-      "sha256": "7e2fe9cd51b50481aa5ca44de4c7fc6d0258441f51f891a5c676aa1ae65c485c"
+      "size_bytes": 872,
+      "sha256": "847b0899d819805f5298d1946efaef887aca95cefa439349e323c7238b58a76b"
     },
     {
       "file": "windows.malware.malfind.Malfind.json",

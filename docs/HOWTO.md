@@ -194,7 +194,7 @@ bundled one, which is reported at the top of the run and recorded in every findi
 
 **What it looks at.** Rules run against three kinds of thing, and a finding's identifier
 says which: `PROC-` for a process, `KERN-` for a kernel module or driver, `SVC-` for a
-service. The shipped pack has 27 rules across all three — process injection and
+service. The shipped pack has 28 rules across all three — process injection and
 hiding, kernel modules missing from the loaded list, SSDT hooks, unbacked drivers, and
 services that are hidden, run from a user-writable path, or are hosted by a process with
 injected code in it.

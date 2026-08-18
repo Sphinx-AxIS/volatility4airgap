@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "name": "default",
-  "version": "2026-08-15",
-  "note": "Rules chosen for confidence rather than coverage. A rule that fires on a busy but healthy host teaches the analyst to ignore its whole category, so a signal earns a place here only when it is rare in normal operation or is qualified by a second, independent one. Dump actions are recommended only where the evidence is strong enough to justify writing live malicious code to the examiner's workstation: the two critical injection rules, hollowing, and ghosting (where memory is the only copy). PROC-INJECT is deliberately excluded — a bare malfind region is why that rule is only medium, and suggesting a dump for each one would undo the distinction. Dumps are never executed unless --dump is given; the analyst is handed the command instead.",
+  "version": "2026-08-17",
+  "note": "Rules chosen for confidence rather than coverage. A rule that fires on a busy but healthy host teaches the analyst to ignore its whole category, so a signal earns a place here only when it is rare in normal operation or is qualified by a second, independent one. Dump actions are recommended only where the evidence is strong enough to justify writing live malicious code to the examiner's workstation: the two critical injection rules, hollowing, ghosting, and a PE image in a .NET process's private memory (in the last two, memory is the only copy). PROC-INJECT is deliberately excluded — a bare malfind region is why that rule is only medium, and suggesting a dump for each one would undo the distinction. Dumps are never executed unless --dump is given; the analyst is handed the command instead.",
   "rules": [
     {
       "id": "PROC-INJECT-NET",
@@ -25,6 +25,17 @@
         { "signal": "suspicious_thread" }
       ],
       "actions": ["inspect_vads", "inspect_threads", "inspect_context", "dump_vads"]
+    },
+    {
+      "id": "PROC-DOTNET-MZ",
+      "severity": "high",
+      "title": "PE image in the executable private memory of a .NET process",
+      "note": "A .NET process trips malfind by design: its JIT compiles into executable private memory, which is why PROC-INJECT annotates such a process rather than escalating it. What the JIT never produces is a PE header. A region beginning with MZ in a process that hosts the runtime is a whole image placed in memory without a file behind it — the shape of Assembly.Load(byte[]) tradecraft and of a DLL reflectively injected into a .NET host — and is the case the annotation must not be allowed to explain away. High rather than critical because legitimate software does embed assemblies as resources and load them from memory; the dump is suggested because the image on disk, if there is one, is not this one. Scoped to .NET processes deliberately: that is where malfind is otherwise expected, so that is where the discriminator earns its keep. malfind_mz is a signal in its own right, so a pack may widen this to every process by dropping the dotnet_runtime clause.",
+      "all": [
+        { "signal": "dotnet_runtime" },
+        { "signal": "malfind_mz" }
+      ],
+      "actions": ["inspect_vads", "inspect_modules", "inspect_context", "dump_vads"]
     },
     {
       "id": "PROC-HIDDEN",
@@ -201,10 +212,14 @@
       "id": "PROC-INJECT",
       "severity": "medium",
       "title": "Executable memory not backed by a file",
-      "note": "Malfind on its own. Every JIT compiler on the host produces this, so it is listed for completeness rather than escalated. The higher-severity rules above are the ones that qualify it.",
+      "note": "Malfind on its own. Every JIT compiler on the host produces this, so it is listed for completeness rather than escalated. The higher-severity rules above are the ones that qualify it. The evidence line says whether the process hosts the .NET runtime and whether any region begins with an MZ header, so a hit on a .NET process reads as what it is without being reasoned out afresh each time — and without being suppressed: the finding still stands, annotated. The one .NET case that is not the JIT, an MZ-headed region, is excluded here because PROC-DOTNET-MZ raises it.",
       "all": [
         { "signal": "malfind" },
-        { "none": [{ "signal": "network_external" }, { "signal": "suspicious_thread" }] }
+        { "none": [
+          { "signal": "network_external" },
+          { "signal": "suspicious_thread" },
+          { "all": [{ "signal": "dotnet_runtime" }, { "signal": "malfind_mz" }] }
+        ] }
       ],
       "actions": ["inspect_vads"]
     },

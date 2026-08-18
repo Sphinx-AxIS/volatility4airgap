@@ -215,7 +215,7 @@ class TestShippedPack:
         return rules.load(rules.DEFAULT_PACK, known_actions=set(followup.ACTIONS))
 
     def test_it_loads(self, pack) -> None:
-        assert len(pack.rules) == 27
+        assert len(pack.rules) == 28
 
     def test_every_signal_is_in_its_entitys_vocabulary(self, pack) -> None:
         for rule in pack.rules:
@@ -303,11 +303,17 @@ class TestEvaluation:
 class TestExpectedFindings:
     """The golden test: the whole pipeline over a fixture with known planting."""
 
-    #: PROC-SYSTEM-MASQUERADE is the newest entry. The fixture has always
-    #: planted a fake lsass — parented by powershell, PEB path spoofed, real
-    #: image at \Device\Temp\x.exe — but nothing read the image path, so it was
-    #: only ever caught indirectly, as one more anomaly in PROC-MULTI-SIGNAL.
-    #: Naming what is actually wrong with it raises it to critical.
+    #: PROC-DOTNET-MZ is the newest entry. The planted powershell's malfind
+    #: region has always begun with MZ; the fixture now also maps clr.dll into
+    #: it, which is what makes that header mean something — a JIT compiles into
+    #: private memory but never writes a PE header there. explorer's region
+    #: begins with MZ too, but explorer hosts no runtime, so it stays a bare
+    #: PROC-INJECT with the header noted in its evidence.
+    #:
+    #: PROC-SYSTEM-MASQUERADE before it: the fixture has always planted a fake
+    #: lsass — parented by powershell, PEB path spoofed, real image at
+    #: \Device\Temp\x.exe — but nothing read the image path, so it was only
+    #: ever caught indirectly, as one more anomaly in PROC-MULTI-SIGNAL.
     EXPECTED = [
         ("KERN-0001", "KERN-SSDT-HOOK", "critical", "evilrk.sys"),
         ("PROC-0001", "PROC-INJECT-NET", "critical", "powershell.exe (PID 4180)"),
@@ -317,14 +323,15 @@ class TestExpectedFindings:
         ("KERN-0002", "KERN-CALLBACK-UNKNOWN", "high", "<unresolved>"),
         ("KERN-0003", "KERN-UNLINKED", "high", "evilrk.sys"),
         ("KERN-0004", "KERN-UNBACKED-DRIVER", "high", "evilrk.sys"),
-        ("PROC-0004", "PROC-MULTI-SIGNAL", "high", "powershell.exe (PID 4180)"),
-        ("PROC-0005", "PROC-HOLLOW", "high", "svchost.exe (PID 5000)"),
-        ("PROC-0006", "PROC-MULTI-SIGNAL", "high", "lsass.exe (PID 6000)"),
-        ("PROC-0007", "PROC-HIDDEN", "high", "rundll32.exe (PID 7224)"),
-        ("PROC-0008", "PROC-XVIEW", "high", "rundll32.exe (PID 7224)"),
+        ("PROC-0004", "PROC-DOTNET-MZ", "high", "powershell.exe (PID 4180)"),
+        ("PROC-0005", "PROC-MULTI-SIGNAL", "high", "powershell.exe (PID 4180)"),
+        ("PROC-0006", "PROC-HOLLOW", "high", "svchost.exe (PID 5000)"),
+        ("PROC-0007", "PROC-MULTI-SIGNAL", "high", "lsass.exe (PID 6000)"),
+        ("PROC-0008", "PROC-HIDDEN", "high", "rundll32.exe (PID 7224)"),
+        ("PROC-0009", "PROC-XVIEW", "high", "rundll32.exe (PID 7224)"),
         ("SVC-0002", "SVC-HIDDEN", "high", "GhostSvc"),
         ("SVC-0003", "SVC-USER-PATH", "high", "UpdaterSvc (PID 2100)"),
-        ("PROC-0009", "PROC-INJECT", "medium", "explorer.exe (PID 2100)"),
+        ("PROC-0010", "PROC-INJECT", "medium", "explorer.exe (PID 2100)"),
     ]
 
     def test_matches(self, sample) -> None:
@@ -371,6 +378,104 @@ class TestExpectedFindings:
         updater = [f for f in findings if getattr(f.entity, "key", "") == "updatersvc"]
 
         assert [f.rule_id for f in updater] == ["SVC-USER-PATH"]
+
+
+def dotnet_process(pid: int, hexdump: str, *, runtime: str | None = "clr.dll"):
+    """A process with one malfind region and, optionally, a mapped runtime.
+
+    Built without the shared fixture so the golden list above stays a
+    regression check rather than growing with every scenario.
+    """
+    entity = analysis.Process(pid=pid, name="app.exe")
+    entity.seen_in["windows.malware.malfind.Malfind"] = [{
+        "PID": pid, "Process": "app.exe", "Start VPN": 0x2A0000,
+        "End VPN": 0x2A0FFF, "Protection": "PAGE_EXECUTE_READWRITE",
+        "PrivateMemory": 1, "Hexdump": hexdump, "Notes": None,
+    }]
+    if runtime:
+        entity.seen_in["windows.malware.ldrmodules.LdrModules"] = [{
+            "Pid": pid, "Process": "app.exe", "Base": 0x7FF000000000,
+            "InLoad": True, "InInit": True, "InMem": True,
+            "MappedPath": f"\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\{runtime}",
+        }]
+    result = analysis.Analysis(processes=[entity])
+    analysis.compute_process_signals(entity, result)
+    return entity, result
+
+
+class TestDotNetMalfind:
+    """A .NET process trips malfind by design; the annotation says so, and the
+    one case that is not the JIT — a region beginning with MZ — is escalated
+    rather than explained away with the rest."""
+
+    @pytest.fixture
+    def pack(self) -> rules.RulePack:
+        return rules.load(rules.DEFAULT_PACK, known_actions=set(followup.ACTIONS))
+
+    def test_jit_output_in_a_dotnet_process_is_annotated_not_suppressed(
+        self, pack
+    ) -> None:
+        _, result = dotnet_process(100, "55 48 8b ec 48 83 ec 20")
+        findings = rules.evaluate(pack, result)
+
+        assert [f.rule_id for f in findings] == ["PROC-INJECT"]
+        (reason,) = [e["reason"] for e in findings[0].evidence]
+        assert "expected in a .NET process" in reason
+        assert "no region begins with an MZ header" in reason
+
+    def test_an_mz_region_in_a_dotnet_process_is_the_exception(self, pack) -> None:
+        _, result = dotnet_process(100, "4d 5a 90 00 03 00 00 00")
+        findings = rules.evaluate(pack, result)
+
+        assert [f.rule_id for f in findings] == ["PROC-DOTNET-MZ"]
+        assert findings[0].severity == "high"
+
+    def test_the_finding_names_the_runtime_and_the_region(self, pack) -> None:
+        """So the dump command the report suggests can be checked against it."""
+        _, result = dotnet_process(100, "4d 5a 90 00 03 00 00 00")
+        (finding,) = rules.evaluate(pack, result)
+        by_plugin = {e["plugin"].rsplit(".", 1)[-1]: e for e in finding.evidence}
+
+        assert "clr.dll mapped" in by_plugin["LdrModules"]["reason"]
+        assert "0x2a0000" in by_plugin["Malfind"]["reason"]
+        assert by_plugin["Malfind"]["row"]["Hexdump"].startswith("4d 5a")
+
+    def test_an_mz_region_without_a_runtime_stays_a_bare_malfind(self, pack) -> None:
+        """No JIT to explain the region, so nothing to discriminate against;
+        the header is noted in the evidence rather than raised."""
+        _, result = dotnet_process(100, "4d 5a 90 00 03 00 00 00", runtime=None)
+        findings = rules.evaluate(pack, result)
+
+        assert [f.rule_id for f in findings] == ["PROC-INJECT"]
+        (reason,) = [e["reason"] for e in findings[0].evidence]
+        assert "MZ header at the start of the region (0x2a0000)" in reason
+        assert ".NET" not in reason
+
+    def test_a_signal_the_rule_excludes_on_is_not_cited_as_evidence(
+        self, pack
+    ) -> None:
+        """PROC-INJECT excludes on (dotnet_runtime and malfind_mz). A process
+        with malfind_mz alone still matches, and that signal must not then
+        appear as if it were why."""
+        entity, result = dotnet_process(100, "4d 5a 90 00", runtime=None)
+        assert "malfind_mz" in entity.signals
+
+        (finding,) = rules.evaluate(pack, result)
+        assert [e["plugin"] for e in finding.evidence] == [
+            "windows.malware.malfind.Malfind"
+        ]
+
+    def test_evidence_signals_leave_out_the_none_clause(self) -> None:
+        rule = rules.Rule(
+            id="R", severity="high", title="t", actions=(),
+            condition={"all": [
+                {"signal": "malfind"},
+                {"none": [{"all": [{"signal": "dotnet_runtime"},
+                                   {"signal": "malfind_mz"}]}]},
+            ]},
+        )
+        assert rule.signals() == {"malfind", "dotnet_runtime", "malfind_mz"}
+        assert rule.evidence_signals() == {"malfind"}
 
 
 class TestOutput:
@@ -432,4 +537,4 @@ class TestOutput:
             rows = list(csv_mod.reader(handle))
 
         assert rows[0] == list(rules.CSV_COLUMNS)
-        assert len(rows) == 17  # header plus sixteen findings
+        assert len(rows) == 18  # header plus seventeen findings

@@ -59,7 +59,12 @@ class Rule:
     entity: str = PROCESS
 
     def signals(self) -> set[str]:
+        """Every signal the rule names, including those it excludes on."""
         return _referenced_signals(self.condition)
+
+    def evidence_signals(self) -> set[str]:
+        """The signals whose presence can be why the rule fired."""
+        return _referenced_signals(self.condition, positive_only=True)
 
 
 @dataclass(frozen=True)
@@ -99,17 +104,28 @@ class Finding:
 # --------------------------------------------------------------------------
 
 
-def _referenced_signals(node) -> set[str]:
+def _referenced_signals(node, *, positive_only: bool = False) -> set[str]:
+    """Every signal a condition names.
+
+    With ``positive_only``, the ones under a ``none`` are left out. Those are
+    the signals whose *absence* the rule asks for, so their presence on an
+    entity is never why the rule fired — and once ``none`` wraps a nested
+    ``all``, an entity can carry one of them and still match. Citing it as
+    evidence would then present a signal the rule was excluding on as if it
+    had contributed.
+    """
     found: set[str] = set()
     if isinstance(node, dict):
         if "signal" in node:
             found.add(node["signal"])
         for key in ("all", "any", "none"):
+            if key == "none" and positive_only:
+                continue
             for child in node.get(key, []) or []:
-                found |= _referenced_signals(child)
+                found |= _referenced_signals(child, positive_only=positive_only)
         if "at_least" in node:
             for child in (node["at_least"] or {}).get("of", []) or []:
-                found |= _referenced_signals(child)
+                found |= _referenced_signals(child, positive_only=positive_only)
     return found
 
 
@@ -119,10 +135,17 @@ def _nearest(name: str, vocabulary) -> str:
     Searched across every entity type, not just the rule's own, so naming a
     module signal in a process rule is told what it actually is rather than
     offered the nearest unrelated word.
+
+    Ties on prefix go to the name closest in length, so "malfound" is offered
+    "malfind" and not "malfind_mz"; and the candidates are sorted first, so
+    the answer does not depend on set iteration order.
     """
     best = max(
-        vocabulary or ALL_SIGNALS,
-        key=lambda known: len(_common_prefix(name, known)),
+        sorted(vocabulary or ALL_SIGNALS),
+        key=lambda known: (
+            len(_common_prefix(name, known)),
+            -abs(len(known) - len(name)),
+        ),
         default="",
     )
     return best if len(_common_prefix(name, best)) >= 3 else ""
@@ -334,6 +357,9 @@ REASON = {
     "psscan_only": "found by scan, absent from the active list, and not exited",
     "exited": "process has terminated",
     "malfind": "executable private memory not backed by a file",
+    "malfind_mz": "executable private memory beginning with an MZ header",
+    "dotnet_runtime": "hosts the .NET runtime, whose JIT compiles into executable "
+                      "private memory",
     "hollow": "process image does not match its backing file",
     "ghosted": "image file marked for deletion while mapped",
     "peb_masquerade": "PEB image path or command line disagrees with the EPROCESS",
@@ -366,6 +392,52 @@ REASON = {
 }
 
 
+def _malfind_reason(entity: Entity, reason: str) -> str:
+    """Say what the malfind rows mean for *this* process, not in general.
+
+    Two facts settle most of the reasoning an analyst otherwise does by hand
+    for every malfind hit. Whether the process hosts a JIT — a .NET runtime
+    compiles into executable private memory as a matter of course, so a region
+    there is the expected shape of the runtime working. And whether any region
+    begins with an MZ header, which a JIT never emits and a loaded image
+    always carries. Both are stated as facts about the evidence; neither
+    changes which rules fired.
+    """
+    dotnet = "dotnet_runtime" in getattr(entity, "signals", set())
+    where = _mz_where(entity)
+
+    if dotnet and where:
+        return (
+            f"{reason}; expected in a .NET process, whose JIT compiles into such "
+            f"memory, but a JIT never emits an MZ header and there is one at the "
+            f"start of {where}"
+        )
+    if dotnet:
+        return (
+            f"{reason}; expected in a .NET process, whose JIT compiles into such "
+            f"memory, and no region begins with an MZ header"
+        )
+    if where:
+        return f"{reason}; MZ header at the start of {where}"
+    return reason
+
+
+def _mz_where(entity: Entity) -> str:
+    """``the region (0x1f0000)`` or ``2 of 5 regions (0x..., 0x...)``, or ``""``
+    when no malfind region begins with an MZ header."""
+    from .analysis import mz_regions, region_start  # local: presentation
+
+    total = len(entity.rows(SIGNAL_SOURCE["malfind"]))
+    with_mz = mz_regions(entity)
+    if not with_mz:
+        return ""
+    starts = [a for a in (region_start(r) for r in with_mz) if a]
+    at = f" ({', '.join(starts)})" if starts else ""
+    if total == 1:
+        return f"the region{at}"
+    return f"{len(with_mz)} of {total} regions{at}"
+
+
 def evidence_for(signal: str, entity: Entity) -> dict | None:
     """One evidence entry, citing the row that produced the signal."""
     plugin = SIGNAL_SOURCE.get(signal)
@@ -385,6 +457,34 @@ def evidence_for(signal: str, entity: Entity) -> dict | None:
                     f"{reason}: {row.get('ForeignAddr')}:{row.get('ForeignPort')}"
                 )
                 return {"plugin": plugin, "reason": reason, "row": row}
+
+    if signal == "malfind":
+        return {"plugin": plugin, "reason": _malfind_reason(entity, reason),
+                "row": rows[0] if rows else None}
+
+    if signal == "malfind_mz":
+        # Cite an MZ region, not whichever malfind row happens to come first,
+        # and name where it is so the dump command below can be checked
+        # against it.
+        from .analysis import mz_regions  # local: presentation detail only
+
+        regions = mz_regions(entity)
+        where = _mz_where(entity)
+        if where:
+            reason = f"MZ header at the start of {where}, in executable private memory"
+        return {"plugin": plugin, "reason": reason,
+                "row": regions[0] if regions else None}
+
+    if signal == "dotnet_runtime":
+        from .analysis import clr_modules  # local: presentation detail only
+
+        modules = clr_modules(entity)
+        if modules:
+            path = str(modules[0].get("MappedPath") or "").replace("/", "\\")
+            basename = path.rsplit("\\", 1)[-1]
+            reason = f"{reason} ({basename} mapped)"
+        return {"plugin": plugin, "reason": reason,
+                "row": modules[0] if modules else None}
 
     if signal == "unusual_parent":
         reason = f"{reason} (PPID {getattr(entity, 'ppid', None)})"
@@ -431,7 +531,7 @@ def evaluate(pack: RulePack, analysis: Analysis) -> list[Finding]:
                 entry
                 for entry in (
                     evidence_for(signal, entity)
-                    for signal in sorted(rule.signals() & entity.signals)
+                    for signal in sorted(rule.evidence_signals() & entity.signals)
                 )
                 if entry is not None
             ]

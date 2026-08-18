@@ -198,6 +198,24 @@ class TestSignals:
         (target,) = analysed.by_pid(2100)
         assert "ldrmodules_unlinked" not in target.signals
 
+    def test_a_process_with_the_clr_mapped_hosts_the_dotnet_runtime(
+        self, analysed
+    ) -> None:
+        (powershell,) = analysed.by_pid(4180)
+        (explorer,) = analysed.by_pid(2100)
+        assert "dotnet_runtime" in powershell.signals
+        assert "dotnet_runtime" not in explorer.signals
+
+    def test_a_malfind_region_beginning_with_mz_is_named_as_such(
+        self, analysed
+    ) -> None:
+        """Both planted regions begin 4d 5a; only the one in a .NET process is
+        the exception to the JIT explanation, but the header is a fact about
+        the region either way."""
+        for pid in (4180, 2100):
+            (target,) = analysed.by_pid(pid)
+            assert "malfind_mz" in target.signals
+
     def test_unusual_parent(self, analysed) -> None:
         """lsass.exe parented by powershell.exe rather than wininit.exe."""
         (target,) = analysed.by_pid(6000)
@@ -726,6 +744,94 @@ class TestLineageSignals:
         assert "suspicious_command_line" in shell
         assert "lolbin_proxy_parent" in payload
         assert "wmi_spawned_process" in payload
+
+
+class TestDotNetAndMzSignals:
+    """The two facts that make a malfind hit self-explaining: does the process
+    host a JIT, and does the region begin with a PE header."""
+
+    MALFIND = "windows.malware.malfind.Malfind"
+    LDR = "windows.malware.ldrmodules.LdrModules"
+
+    def region(self, **overrides) -> dict:
+        row = {"PID": 100, "Process": "app.exe", "Start VPN": 0x1F0000,
+               "End VPN": 0x1F0FFF, "Hexdump": "4d 5a 90 00", "Notes": None}
+        row.update(overrides)
+        return row
+
+    def module(self, path: str) -> dict:
+        return {"Pid": 100, "Process": "app.exe", "Base": 0x7FF000000000,
+                "InLoad": True, "InInit": True, "InMem": True, "MappedPath": path}
+
+    def signals(self, malfind=(), ldr=()) -> set:
+        rows = {self.MALFIND: list(malfind), self.LDR: list(ldr)}
+        return signals_of(analysed_from([(100, 4, "app.exe")], rows), 100)
+
+    def test_mz_is_read_from_the_hexdump(self) -> None:
+        assert "malfind_mz" in self.signals(malfind=[self.region()])
+
+    def test_a_function_prologue_is_not_mz(self) -> None:
+        found = self.signals(malfind=[self.region(Hexdump="55 48 8b ec 48 83")])
+        assert "malfind" in found
+        assert "malfind_mz" not in found
+
+    def test_the_hexdump_may_be_packed_or_upper_case(self) -> None:
+        assert "malfind_mz" in self.signals(malfind=[self.region(Hexdump="4D5A9000")])
+
+    def test_malfinds_own_verdict_is_the_fallback(self) -> None:
+        """A row whose hexdump did not render still carries the Notes column."""
+        row = self.region(Hexdump="N/A", Notes="MZ header")
+        assert "malfind_mz" in self.signals(malfind=[row])
+
+    def test_a_missing_hexdump_and_no_verdict_is_not_mz(self) -> None:
+        row = self.region(Hexdump=None, Notes=None)
+        assert "malfind_mz" not in self.signals(malfind=[row])
+
+    @pytest.mark.parametrize("path", [
+        "\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\clr.dll",
+        "\\Windows\\Microsoft.NET\\Framework\\v2.0.50727\\mscorwks.dll",
+        "\\Program Files\\dotnet\\shared\\Microsoft.NETCore.App\\8.0.4\\coreclr.dll",
+        "\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\CLRJIT.DLL",
+    ])
+    def test_each_runtime_generation_is_recognised(self, path) -> None:
+        assert "dotnet_runtime" in self.signals(ldr=[self.module(path)])
+
+    def test_the_shim_alone_is_not_a_runtime(self) -> None:
+        """mscoree.dll decides whether to load a runtime; plenty of processes
+        carry it for a COM call that never JITs anything."""
+        found = self.signals(ldr=[self.module("\\Windows\\System32\\mscoree.dll")])
+        assert "dotnet_runtime" not in found
+
+    def test_a_native_module_is_not_a_runtime(self) -> None:
+        found = self.signals(ldr=[self.module("\\Windows\\System32\\ntdll.dll")])
+        assert "dotnet_runtime" not in found
+
+    def test_the_runtime_is_found_whatever_the_peb_lists_say(self) -> None:
+        """LdrModules reports the mapped file from the VAD, so an unlinked
+        runtime still counts — the point is whether a JIT is present."""
+        module = self.module("\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\clr.dll")
+        module.update(InLoad=False, InInit=False)
+        assert "dotnet_runtime" in self.signals(ldr=[module])
+
+    def test_neither_signal_without_its_plugin(self) -> None:
+        found = self.signals()
+        assert not found & {"malfind", "malfind_mz", "dotnet_runtime"}
+
+    def test_the_helpers_hand_back_the_rows_that_matter(self) -> None:
+        """The report cites these, so they must be the MZ row and the runtime
+        row rather than whichever came first."""
+        rows = {
+            self.MALFIND: [self.region(Hexdump="55 48 8b ec", **{"Start VPN": 0x100000}),
+                           self.region()],
+            self.LDR: [self.module("\\Windows\\System32\\ntdll.dll"),
+                       self.module("\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\clr.dll")],
+        }
+        result = analysed_from([(100, 4, "app.exe")], rows)
+        (process,) = result.by_pid(100)
+
+        assert [analysis.region_start(r) for r in analysis.mz_regions(process)] == ["0x1f0000"]
+        (runtime,) = analysis.clr_modules(process)
+        assert runtime["MappedPath"].endswith("clr.dll")
 
 
 class TestExternalAddresses:

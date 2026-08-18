@@ -54,8 +54,20 @@ def proc_row(pid, ppid, name, offset, exit_time, offset_key="Offset(V)"):
     }
 
 
+def write_lf(path, text):
+    """Write with LF endings whatever the platform.
+
+    The manifest below records a SHA-256 for every file, and .gitattributes
+    marks the folder ``-text`` so git never converts it either. Python's text
+    mode would write CRLF on Windows, changing every digest, so the newline is
+    pinned here rather than left to the platform.
+    """
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+
+
 def write(name, rows):
-    (OUT / name).write_text("\n" + json.dumps(rows, indent=2, sort_keys=True) + "\n")
+    write_lf(OUT / name, "\n" + json.dumps(rows, indent=2, sort_keys=True) + "\n")
 
 
 write("windows.pslist.PsList.json", [proc_row(*p) for p in PROCS])
@@ -116,6 +128,13 @@ write("windows.malware.ldrmodules.LdrModules.json", [
     {"__children": [], "Pid": 2100, "Process": "explorer.exe", "Base": 0x7FF000002000,
      "InLoad": False, "InInit": False, "InMem": False,
      "MappedPath": "\\Windows\\Fonts\\segoeui.ttf"},
+    # The .NET runtime, present in every PEB list, in the planted powershell.
+    # Its malfind region above begins with MZ — the one .NET malfind hit that
+    # is not the JIT. explorer's region begins with MZ too, but explorer hosts
+    # no runtime, so it stays a bare PROC-INJECT with the header noted.
+    {"__children": [], "Pid": 4180, "Process": "powershell.exe", "Base": 0x7FF000003000,
+     "InLoad": True, "InInit": True, "InMem": True,
+     "MappedPath": "\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\clr.dll"},
 ])
 
 write("windows.malware.pebmasquerade.PebMasquerade.json", [
@@ -238,7 +257,7 @@ for path in sorted(p for p in OUT.rglob("*") if p.is_file() and p != MANIFEST):
         "sha256": digest,
     })
 
-MANIFEST.write_text(json.dumps({
+write_lf(MANIFEST, json.dumps({
     "schema_version": 1,
     "tool_version": "0.1.0",
     "image": {"path": "D:\\memory.raw", "name": "memory.raw",

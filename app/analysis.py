@@ -897,6 +897,8 @@ VOCABULARY: dict[str, frozenset[str]] = {
             "pslist", "psscan", "psscan_only", "exited", "malfind", "hollow",
             "ghosted", "peb_masquerade", "psxview_hidden", "suspicious_thread",
             "ldrmodules_unlinked", "network", "network_external", "unusual_parent",
+            # What the malfind region contains, and what the process is.
+            "malfind_mz", "dotnet_runtime",
             # Image and context.
             "system_process_wrong_path", "user_writable_image",
             "system_process_wrong_session", "system_process_wrong_user",
@@ -934,6 +936,8 @@ SIGNAL_SOURCE: dict[str, str] = {
     "psscan_only": "windows.psscan.PsScan",
     "exited": "windows.psscan.PsScan",
     "malfind": "windows.malware.malfind.Malfind",
+    "malfind_mz": "windows.malware.malfind.Malfind",
+    "dotnet_runtime": "windows.malware.ldrmodules.LdrModules",
     "hollow": "windows.malware.hollowprocesses.HollowProcesses",
     "ghosted": "windows.malware.processghosting.ProcessGhosting",
     "peb_masquerade": "windows.malware.pebmasquerade.PebMasquerade",
@@ -1109,6 +1113,76 @@ USER_WRITABLE = ("\\users\\", "\\temp\\", "\\appdata\\", "\\tmp\\",
 
 _NETWORK_PLUGINS = ("windows.netscan.NetScan", "windows.netstat.NetStat")
 
+_MALFIND = "windows.malware.malfind.Malfind"
+_LDRMODULES = "windows.malware.ldrmodules.LdrModules"
+
+#: The modules that are the .NET runtime, by basename. A process with one of
+#: these mapped has a JIT compiler in it, and a JIT compiles into executable
+#: private memory — which is precisely what malfind reports. So a bare malfind
+#: hit on such a process is the expected shape of the runtime working, and is
+#: annotated as such rather than escalated.
+#:
+#: mscoree.dll is deliberately absent. It is the shim that decides whether to
+#: load a runtime, and plenty of processes carry it for a COM interop call that
+#: never JITs anything; its presence does not make the explanation available.
+DOTNET_RUNTIME_MODULES = frozenset(
+    {
+        "clr.dll",        # .NET Framework 4.x
+        "coreclr.dll",    # .NET Core, .NET 5 and later
+        "mscorwks.dll",   # .NET Framework 2.0–3.5
+        "clrjit.dll",     # the JIT itself, 4.x and Core
+        "mscorjit.dll",   # the JIT, 2.0
+    }
+)
+
+
+def clr_modules(process: Process) -> list[dict]:
+    """The LdrModules rows that map a .NET runtime module into ``process``.
+
+    LdrModules lists every VAD whose first bytes are an MZ header, with the
+    file it was mapped from, so the runtime appears here whether or not the
+    PEB lists still admit to it.
+    """
+    found: list[dict] = []
+    for row in process.rows(_LDRMODULES):
+        basename = str(row.get("MappedPath") or "").replace("/", "\\").rsplit("\\", 1)[-1]
+        if basename.lower() in DOTNET_RUNTIME_MODULES:
+            found.append(row)
+    return found
+
+
+def _starts_with_mz(row: dict) -> bool:
+    """Whether a malfind region begins with a DOS header.
+
+    Read from the hexdump — the JSON renderer writes it as space-separated hex,
+    ``4d 5a 90 00 ...`` — with malfind's own ``Notes`` verdict as the fallback
+    for a row whose hexdump did not render. Whitespace is stripped before the
+    comparison so a renderer that packs the bytes still matches.
+    """
+    hexdump = row.get("Hexdump")
+    if _present(hexdump):
+        packed = "".join(str(hexdump).split()).lower()
+        if packed:
+            return packed.startswith("4d5a")
+    return str(row.get("Notes") or "").strip().lower() == "mz header"
+
+
+def mz_regions(process: Process) -> list[dict]:
+    """The malfind rows whose region begins with an MZ header.
+
+    A JIT emits code, never a PE header. A region that starts with one is a
+    whole image placed in memory without a file behind it: what a reflectively
+    loaded DLL or an ``Assembly.Load(byte[])`` looks like from the outside.
+    """
+    return [row for row in process.rows(_MALFIND) if _starts_with_mz(row)]
+
+
+def region_start(row: dict) -> str | None:
+    """A malfind row's start address as ``0x...``, or ``None`` if it has none."""
+    start = _as_int(row.get("Start VPN"))
+    return f"0x{start:x}" if start is not None else None
+
+
 #: Windows process IDs are allocated below this; anything above is not one.
 _MAX_PID = 4_194_304
 #: Generous: the busiest real process on a loaded server stays in the hundreds.
@@ -1208,8 +1282,15 @@ def compute_process_signals(process: Process, analysis: Analysis) -> None:
     if in_psscan and not in_pslist and not exited:
         signals.add("psscan_only")
 
-    if process.rows("windows.malware.malfind.Malfind"):
+    if process.rows(_MALFIND):
         signals.add("malfind")
+        # Kept separate from malfind rather than folded into it: the region's
+        # first bytes are what tell JIT output from a loaded image, and a rule
+        # has to be able to ask for one without the other.
+        if mz_regions(process):
+            signals.add("malfind_mz")
+    if clr_modules(process):
+        signals.add("dotnet_runtime")
     if process.rows("windows.malware.hollowprocesses.HollowProcesses"):
         signals.add("hollow")
     if process.rows("windows.malware.processghosting.ProcessGhosting"):
