@@ -668,6 +668,38 @@ class TestStringsHitsCommand:
                      "--out", str(tmp_path / "r"), "--term", "needle"]) == 5
         assert "Is this the strings file for this image" in capsys.readouterr().err
 
+    def test_all_unresolved_but_wrapped_structure_warns_not_exit_five(
+        self, tmp_path, image, fake_engine, monkeypatch, capsys
+    ) -> None:
+        # A wrapped Sysinternals file of a >4 GiB image whose only matches are
+        # strings with no stable page (signature fragments, transient text): the
+        # offsets are structurally right, so it must not be rejected as the wrong
+        # file. Small WRAP/DROP let the tiny fixture stand in for a large image:
+        # the first line sits near the wrap, the matched line restarts near zero.
+        monkeypatch.setattr(S, "WRAP", WRAP)
+        monkeypatch.setattr(S, "DROP", 1 << 14)
+        strings_file = tmp_path / "s.strings"
+        strings_file.write_bytes(
+            b"60000:high offset filler that does not match\n"
+            b"100:phantom string absent from memory\n"
+        )
+        out = tmp_path / "r"
+        assert main(["strings-hits", "--image", str(image), "--strings-file",
+                     str(strings_file), "--out", str(out), "--term", "phantom"]) == 0
+        captured = capsys.readouterr()
+        assert "most likely the right one" in captured.err
+        assert "Is this the strings file for this image" not in captured.err
+        assert "No hit resolved" in captured.out
+        # nothing resolved, so the plugin never ran and the hits file is empty
+        assert fake_engine.calls == []
+        assert (out / "strings" / "strings-hits.txt").read_bytes() == b""
+        assert (out / "strings" / "strings-hits-unresolved.txt").read_bytes() == (
+            b"100:phantom string absent from memory\n"
+        )
+        record = json.loads((out / "strings" / "strings-hits.json").read_text())
+        assert record["at_stated_offset"] == 0 and record["relocated"] == 0
+        assert record["unresolved"] == 1 and "plugin" not in record
+
     def test_trust_offsets_skips_the_check(self, tmp_path, image, fake_engine, capsys) -> None:
         strings_file = tmp_path / "s.strings"
         strings_file.write_bytes(b"555:needle nowhere in memory\n")

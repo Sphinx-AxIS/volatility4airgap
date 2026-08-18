@@ -1179,10 +1179,29 @@ def cmd_strings_hits(args: argparse.Namespace) -> int:
             print(f"  (no offset in the file exceeds 4 GiB although the image is "
                   f"{image_size / 2**30:.1f} GiB; the sequence restarts {scan.drops} time(s))")
         if not location.at_stated and not location.relocated:
-            print("\nerror: none of the hits is in this image at its offset or at any "
-                  "4 GiB multiple of it. Is this the strings file for this image?",
+            # None of the hits resolved. Two different situations look identical
+            # here, so tell them apart before crying "wrong file". If the offsets
+            # are structurally those of a wrapped 32-bit strings file of THIS image
+            # — none above 4 GiB though the image is larger, and the sequence
+            # restarting where it folds — the file is almost certainly the right
+            # one, and these particular terms simply landed on strings with no
+            # stable page of their own (AV-signature buffers, transient scan text).
+            # Warn and keep the run rather than reject a good file on an
+            # unrepresentative handful of hits. Only with no such evidence is a
+            # mismatched file the likely cause, and only then is exit 5 earned.
+            wrapped_structure = (
+                scan.drops > 0 and scan.max_offset < strings_mod.WRAP <= image_size
+            )
+            if not wrapped_structure:
+                print("\nerror: none of the hits is in this image at its offset or at any "
+                      "4 GiB multiple of it. Is this the strings file for this image?",
+                      file=sys.stderr)
+                return 5
+            print("\nwarning: none of these hits resolves to a page in the image, but the "
+                  "file's offsets are those of a wrapped 32-bit strings file of this image, "
+                  "so it is most likely the right one — these particular strings just have "
+                  "no stable location. Search for a term you know is genuinely present.",
                   file=sys.stderr)
-            return 5
         lines = strings_mod.plugin_lines(scan.hits, wrapped=location.wrapped)
 
     hits_path = strings_dir / "strings-hits.txt"
@@ -1223,7 +1242,14 @@ def cmd_strings_hits(args: argparse.Namespace) -> int:
     }
 
     code = 0
-    if not args.no_run:
+    if not lines:
+        # Only reached via the softened case above: the file looks right, but
+        # these terms resolved to nothing the plugin could place. Running it on an
+        # empty input would build the whole reverse map to attribute zero lines;
+        # the warning already said why.
+        print("\nNo hit resolved to a page, so windows.strings was not run — it "
+              "would have nothing to attribute.")
+    elif not args.no_run:
         try:
             engine = engine_mod.select(args.engine, BUNDLE_ROOT)
         except (engine_mod.EngineUnavailable, ValueError) as exc:

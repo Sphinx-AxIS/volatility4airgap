@@ -264,8 +264,13 @@ Every hit is verified by reading the image at its offset — and, when the image
 4 GiB, at each offset a 32-bit wrap could have folded onto it. A hit found only at such a
 folded offset is the signature of a Sysinternals file, and the true offsets are used. A
 hit found nowhere is kept out of the plugin's input rather than mis-attributed, and listed
-so you can search for it by hand. If *no* hit is in the image at all, the strings file is
-for some other image, and the command stops (exit code 5).
+so you can search for it by hand. If *no* hit resolves, the command tells two cases apart.
+When the file's offsets are structurally those of a wrapped 32-bit copy of *this* image
+(none above 4 GiB though the image is larger, the sequence restarting where it folds), the
+file is most likely the right one and your terms simply landed on strings with no stable
+page — a signature buffer, transient text — so it warns and suggests a term you know is
+genuine, rather than stopping. Only when the offsets show no such structure is the file
+taken to be for some other image, and the command stops (exit code 5).
 
 | Option | Default | What it does |
 | --- | --- | --- |
@@ -537,7 +542,7 @@ diagnostic is lost. If a plugin you expected is absent from the output folder, c
 | `2` | Bad input | Fix the path or option named in the error |
 | `3` | Symbols missing | Run `fetch-symbols` on a connected machine |
 | `4` | Probe failed | Read the diagnosis; `--force` to run anyway |
-| `5` | Evidence does not match: `analyze` given a different image or pagefile than the triage run; `strings-hits` given a strings file none of whose hits is in the image | Supply the image and pagefile that were triaged; check the strings file is this image's |
+| `5` | Evidence does not match: `analyze` given a different image or pagefile than the triage run; `strings-hits` given a strings file none of whose hits is in the image and whose offsets do not look like a wrapped copy of it | Supply the image and pagefile that were triaged; check the strings file is this image's |
 | `6` | Plugin output does not match `run-manifest.json` | Re-run triage, or `--allow-modified-input` |
 
 Useful in a batch file:
