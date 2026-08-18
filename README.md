@@ -14,7 +14,13 @@ Installs nothing. Needs no Python on the target and no administrator rights.
 
 ## Status
 
-Feature complete.
+**0.5.0b1 — beta.** Feature complete, and run against real captures on an air-gapped
+Windows x64 workstation. Two false positives found that way have been fixed, and the
+sample of distinct images is still small, so read findings as a prioritised worklist
+rather than a conclusion.
+
+What has to be true before a production release candidate is set out in
+[docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
 
 | | |
 | --- | --- |

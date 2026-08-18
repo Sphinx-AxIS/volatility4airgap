@@ -1,6 +1,6 @@
 [project]
 name = "volatility4airgap"
-version = "0.1.0"
+version = "0.5.0b1"
 description = "Portable Volatility3 triage for air-gapped Windows workstations"
 requires-python = ">=3.9"
 # The tool itself uses only the standard library. volatility3 is supplied by the

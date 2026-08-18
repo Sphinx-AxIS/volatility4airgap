@@ -269,7 +269,7 @@ component imports. Run this first whenever something behaves oddly.
 ### `--version`
 
 ```
-v4ag 0.1.0 (built 2026-08-06T04:47:39+00:00, payload 0efe5162)
+v4ag 0.5.0b1 (built 2026-08-06T04:47:39+00:00, payload 0efe5162)
 ```
 
 The build time and payload digest identify exactly which bundle you are running. Check

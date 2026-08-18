@@ -686,3 +686,19 @@ class TestDocumentedCountsAreCurrent:
 
         missing = sorted(c for c in used if f"`{c}`" not in section)
         assert not missing, f"README exit codes omit: {missing}"
+
+    def test_the_declared_version_matches_the_package(self) -> None:
+        """tool_version lands in every manifest, so a drifted pyproject would
+        make the custody record name a release that was never built."""
+        import re
+        import sys
+
+        sys.path.insert(0, str(REPO_ROOT))
+        from app import __version__
+
+        declared = re.search(
+            r'^version = "([^"]+)"', self._text("pyproject.toml"), re.M
+        )
+
+        assert declared, "pyproject.toml declares no version"
+        assert declared.group(1) == __version__
