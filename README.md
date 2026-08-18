@@ -2,10 +2,13 @@
 
 A portable Volatility3 triage tool for air-gapped Windows workstations.
 
-Runs Volatility3 against a memory image, writes one CSV and one JSON per plugin, and —
-when the kernel symbols are missing — prints the exact Microsoft symbol-server URL and the
-exact ISF filename Volatility needs. Fetch the symbols on an internet-connected machine,
-carry them back, re-run the same command.
+Runs Volatility3 against a memory image, writes one file per plugin, then correlates
+those outputs into a prioritised list of findings and collects the evidence an examiner
+would ask for next.
+
+When the kernel symbols are missing it prints the exact Microsoft symbol-server URL and
+the exact ISF filename Volatility needs. Fetch the symbols on an internet-connected
+machine, carry them back, re-run the same command.
 
 Installs nothing. Needs no Python on the target and no administrator rights.
 
@@ -15,10 +18,12 @@ Feature complete.
 
 | | |
 | --- | --- |
-| `triage` | runs plugins, one CSV and one JSON each, with `--jobs` |
+| `triage` | runs the plugin set against an image and writes one file per plugin per format |
+| `analyze` | correlates a finished run into findings, and collects the follow-up evidence |
 | `symbols` | identifies the kernel, reports URLs, writes `symbol_request.json` |
 | `fetch-symbols` | downloads and converts symbols on the connected side |
 | `verify` | checks a request is satisfied before you walk back |
+| `check` | verifies a bundle against the digests recorded at build time |
 | `doctor` | reports build identity, architecture and import health |
 
 Design: [docs/plans/2026-08-05-portable-memory-triage-design.md](docs/plans/2026-08-05-portable-memory-triage-design.md)
@@ -56,8 +61,27 @@ produces a symbol file Volatility silently ignores.
 
 Copy the resulting `symbols/` folder back and re-run.
 
+### After the run
+
+`triage` records what the plugins said. `analyze` works out which of it matters:
+
+```
+v4ag.bat analyze output\image
+```
+
+It reads the JSON that run wrote, correlates rows across plugins into one record per
+process, kernel module and service, and applies a rule pack. Findings land in
+`output\image\findings\` — as JSON for machines, CSV for a spreadsheet, and text to
+read — each one naming the rule that produced it and the plugin rows that triggered it.
+
+No memory image is needed, so this can run against an archived output folder days later
+on a different machine. Give it `--image` as well and it also runs the targeted, scoped
+Volatility commands the findings imply, filing the results under
+`output\image\followup\`.
+
 Exit codes: `0` success, `1` plugin failures or no kernel found, `2` bad input,
-`3` symbols missing, `4` probe failed.
+`3` symbols missing, `4` probe failed, `5` evidence does not match the triage run,
+`6` plugin output does not match `run-manifest.json`.
 
 ### Choosing plugins
 
@@ -65,15 +89,27 @@ Exit codes: `0` success, `1` plugin failures or no kernel found, `2` bad input,
 v4ag.bat triage --image ... --plugins network,registry     # by category
 v4ag.bat triage --image ... --plugins windows.pslist.PsList
 v4ag.bat triage --image ... --all                          # every Windows plugin
-v4ag.bat triage --image ... --format csv                   # skip JSON, halves the work
+v4ag.bat triage --image ... --format json                  # one format, half the work
 ```
 
-The default is a curated 29-plugin Windows triage set. Each requested format is rendered
-by its own Volatility run, so `--format csv,json` runs each plugin twice; narrow it if
-wall-clock matters more than having both.
+The default is a curated 39-plugin Windows triage set.
 
-`--jobs` defaults to 1. Parallelism helps on NVMe with enough RAM to cache the image, and
-can *hurt* on a USB-attached evidence drive where workers contend for the same reads.
+### Formats and speed
+
+Two separate knobs, often confused because both affect how long a run takes.
+
+`--format` selects which of `csv` and `json` to write, and defaults to both. Each format
+is a separate Volatility run, so the default renders every plugin twice — dropping one
+halves the work.
+
+**Drop `csv`, not `json`.** `analyze` reads the JSON and never the CSV, so a CSV-only
+folder cannot be analysed; it refuses and tells you to re-run. CSV is for reading and for
+feeding other tools, JSON is the machine interface, and keeping both is only worth the
+second pass if something downstream consumes the CSV.
+
+`--jobs` is unrelated to output: it sets how many plugins run concurrently, and defaults
+to 1. Parallelism helps on NVMe with enough RAM to cache the image, and can *hurt* on a
+USB-attached evidence drive where workers contend for the same reads.
 
 ## Building
 

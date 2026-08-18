@@ -6,6 +6,7 @@ The build script is not importable as a package, so it is loaded by path.
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import zipfile
 from pathlib import Path
@@ -614,3 +615,74 @@ class TestWindowsExtractorCompatibility:
         bp.write_deterministic_zip(root, first)
         bp.write_deterministic_zip(root, second)
         assert first.read_bytes() == second.read_bytes()
+
+
+class TestDocumentedCountsAreCurrent:
+    """Counts written into prose drift silently as the code grows.
+
+    The README claimed a 29-plugin triage set when there were 39, and the HOWTO
+    claimed fifteen rules when the pack held 27 — both accurate when written,
+    both wrong within a release. A reader has no way to tell, so the number is
+    worse than no number at all unless something checks it.
+    """
+
+    def _text(self, name: str) -> str:
+        import sys
+
+        sys.path.insert(0, str(REPO_ROOT))
+        return (REPO_ROOT / name).read_text(encoding="utf-8")
+
+    def test_the_readme_plugin_count_matches_the_catalogue(self) -> None:
+        import re
+        import sys
+
+        sys.path.insert(0, str(REPO_ROOT))
+        from app import plugins
+
+        text = self._text("README.md")
+        claimed = re.search(r"curated (\d+)-plugin", text)
+
+        assert claimed, "README no longer states the triage set size"
+        assert int(claimed.group(1)) == len(plugins.TRIAGE)
+
+    def test_the_howto_rule_count_matches_the_shipped_pack(self) -> None:
+        import re
+        import sys
+
+        sys.path.insert(0, str(REPO_ROOT))
+        from app import followup, rules
+
+        pack = rules.load(rules.DEFAULT_PACK, known_actions=set(followup.ACTIONS))
+        claimed = re.search(r"shipped pack has (\d+) rules", self._text("docs/HOWTO.md"))
+
+        assert claimed, "HOWTO no longer states the rule count"
+        assert int(claimed.group(1)) == len(pack.rules)
+
+    def test_the_readme_documents_every_command(self) -> None:
+        """analyze existed for three commits without appearing in the README."""
+        import sys
+
+        sys.path.insert(0, str(REPO_ROOT))
+        from app.__main__ import _COMMANDS
+
+        text = self._text("README.md")
+        missing = [c for c in _COMMANDS if c not in text]
+
+        assert not missing, f"README does not mention: {missing}"
+
+    def test_the_readme_lists_every_exit_code(self) -> None:
+        """A stale list reads as 'that code cannot happen'."""
+        import re
+        import sys
+
+        sys.path.insert(0, str(REPO_ROOT))
+        from app import __main__ as cli
+
+        source = inspect.getsource(cli)
+        used = {int(m) for m in re.findall(r"^\s*return (\d)\s*$", source, re.M)}
+        text = self._text("README.md")
+        section = text[text.index("Exit codes:"):]
+        section = section[: section.index("\n\n")]
+
+        missing = sorted(c for c in used if f"`{c}`" not in section)
+        assert not missing, f"README exit codes omit: {missing}"
