@@ -8,6 +8,7 @@ a string cut in two, or emitted twice, or a UTF-16 pair split between reads.
 from __future__ import annotations
 
 import codecs
+import hashlib
 import json
 import os
 import random
@@ -699,6 +700,38 @@ class TestStringsHitsCommand:
         record = json.loads((out / "strings" / "strings-hits.json").read_text())
         assert record["at_stated_offset"] == 0 and record["relocated"] == 0
         assert record["unresolved"] == 1 and "plugin" not in record
+
+    def test_reopening_output_to_hash_cannot_crash_the_run(
+        self, tmp_path, image, wrapped_strings, fake_engine, monkeypatch, capsys
+    ) -> None:
+        # The output files are nothing but attacker command lines, so the analysis
+        # host's own AV quarantines or locks them the instant they land. Any
+        # reopen-to-hash of them must not be able to bring the run down: sha256_file
+        # is made to fail for every path, standing in for that quarantine.
+        monkeypatch.setattr(S, "WRAP", WRAP)
+        import app.manifest as manifest_mod
+
+        def refuse(_path):
+            raise OSError(22, "Invalid argument")
+
+        monkeypatch.setattr(manifest_mod, "sha256_file", refuse)
+        fake_engine.rows = [
+            {"String": "needle in the second pass", "Physical Address": WRAP + 100,
+             "Result": "FREE MEMORY"},
+        ]
+        out = tmp_path / "r"
+        assert main(["strings-hits", "--image", str(image), "--strings-file",
+                     str(wrapped_strings), "--out", str(out), "--term", "needle"]) == 0
+        record = json.loads((out / "strings" / "strings-hits.json").read_text())
+        # the files we authored are hashed from memory, so their digests still stand
+        hits = (out / "strings" / "strings-hits.txt").read_bytes()
+        assert record["plugin_input"]["sha256"] == hashlib.sha256(hits).hexdigest()
+        report = (out / "strings" / "strings-hits-report.txt").read_bytes()
+        assert record["report"]["sha256"] == hashlib.sha256(report).hexdigest()
+        # the plugin's own output is hashed from disk, so it degrades to null
+        # rather than taking a finished run down with it
+        assert record["plugin"]["sha256"] is None
+        assert record["plugin"]["rows"] == 1
 
     def test_trust_offsets_skips_the_check(self, tmp_path, image, fake_engine, capsys) -> None:
         strings_file = tmp_path / "s.strings"

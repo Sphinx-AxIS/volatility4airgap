@@ -28,6 +28,19 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def sha256_bytes(data: bytes) -> str:
+    """Digest bytes already in hand, without reopening a file to read them back.
+
+    Preferred over ``sha256_file`` for output this process just produced. A
+    strings-hits file is nothing but attacker command lines, and the analysis
+    host's own antivirus quarantines or locks it in the instant between writing
+    it and reopening it — a reopen there crashed the run before the plugin even
+    started. Hashing the bytes we still hold records the same digest with no
+    second open for endpoint protection to fail.
+    """
+    return hashlib.sha256(data).hexdigest()
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 

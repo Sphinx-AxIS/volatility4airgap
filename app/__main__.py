@@ -1205,7 +1205,8 @@ def cmd_strings_hits(args: argparse.Namespace) -> int:
         lines = strings_mod.plugin_lines(scan.hits, wrapped=location.wrapped)
 
     hits_path = strings_dir / "strings-hits.txt"
-    hits_path.write_bytes(b"".join(lines))
+    hits_payload = b"".join(lines)
+    hits_path.write_bytes(hits_payload)
     unresolved_path = strings_dir / "strings-hits-unresolved.txt"
     unresolved = strings_mod.unresolved_lines(scan.hits) if location is not None else []
     if unresolved:
@@ -1236,7 +1237,11 @@ def cmd_strings_hits(args: argparse.Namespace) -> int:
         "plugin_input": {
             "file": hits_path.name,
             "lines": len(lines),
-            "sha256": manifest.sha256_file(hits_path),
+            # Hash the bytes we still hold, not a reopen of the file: this output
+            # is nothing but attacker command lines, and the host's own AV
+            # quarantines or locks it the instant it lands. A reopen here is what
+            # crashed the run before the plugin even started.
+            "sha256": manifest.sha256_bytes(hits_payload),
         },
         "started_utc": started,
     }
@@ -1292,7 +1297,13 @@ def cmd_strings_hits(args: argparse.Namespace) -> int:
             print(f"  ok ({result.duration:.1f}s)")
             rows = analysis_mod.load_rows(task.stdout_path)
             record["plugin"]["rows"] = len(rows)
-            record["plugin"]["sha256"] = manifest.sha256_file(task.stdout_path)
+            # The subprocess wrote this one, so its bytes are not in hand; hash it
+            # from disk, but never let a late quarantine of it discard a run that
+            # has already succeeded.
+            try:
+                record["plugin"]["sha256"] = manifest.sha256_file(task.stdout_path)
+            except OSError:
+                record["plugin"]["sha256"] = None
 
             names: dict[int, str] = {}
             pslist = analysis_mod.output_json_path(results_dir, "windows.pslist.PsList")
@@ -1316,12 +1327,15 @@ def cmd_strings_hits(args: argparse.Namespace) -> int:
                 f"run {record['started_utc']}",
                 "",
             ]
-            report_path.write_text(
-                "\n".join(header + strings_mod.report_lines(groups)) + "\n", encoding="utf-8"
-            )
+            report_bytes = (
+                "\n".join(header + strings_mod.report_lines(groups)) + "\n"
+            ).encode("utf-8")
+            report_path.write_bytes(report_bytes)
             record["report"] = {
                 "file": report_path.name,
-                "sha256": manifest.sha256_file(report_path),
+                # Same reasoning as the hits file: hash what we just wrote, in
+                # memory, so the record survives AV touching the report on disk.
+                "sha256": manifest.sha256_bytes(report_bytes),
             }
             print(f"\nReport {report_path}")
             print(f"Table  {task.stdout_path}")
