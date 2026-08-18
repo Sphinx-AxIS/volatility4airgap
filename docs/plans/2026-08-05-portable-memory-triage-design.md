@@ -33,7 +33,7 @@ covered in "Defects corrected" below.
 | Decision | Choice |
 | --- | --- |
 | Packaging | Portable folder plus `.bat` launcher, not a single `.exe` |
-| Build host | macOS. No Windows machine is needed to produce the Windows x64 bundle |
+| Build host | Any of Windows, macOS or Linux; none needs to match the target |
 | Output | CSV and JSON per plugin |
 | Plugin selection | Curated Windows triage set by default; `--all` and `--plugins` override |
 | Symbol pack | Bundle `windows.zip` (800 MB); `--lean` builds without it |
@@ -53,7 +53,7 @@ Producing a single `.exe` would also require an x64 Windows build host. The avai
 runs Windows on ARM, where PyInstaller would emit an ARM64 binary that will not run on a
 standard analyst workstation.
 
-### Why macOS can build a Windows bundle
+### Why any host can build a Windows bundle
 
 Verified against the live package index:
 
@@ -63,9 +63,16 @@ Verified against the live package index:
   prebuilt `win_amd64` wheel, about 9 MB in total.
 - The Python 3.12.10 embeddable amd64 distribution is an 11 MB zip.
 
-Nothing requires compilation, so `pip download --platform win_amd64` on macOS retrieves
-every Windows binary needed. The build never executes Windows code, which is why the ARM
-VM is irrelevant to it.
+Nothing requires compilation, so `pip download --platform win_amd64` retrieves every
+Windows binary needed whatever the host is. The build never executes Windows code and
+never bundles the host's own interpreter, which is why the host's operating system and
+architecture are both irrelevant — including the ARM VM, and including an x64 Windows
+machine.
+
+Originally verified on macOS, which is where the constraint was felt: the only Windows
+machine available ran on ARM. The conclusion was never macOS-specific, and the build
+strips host-shaped leftovers under both `bin/` and `Scripts/` so a Windows host produces
+a byte-identical payload.
 
 The embeddable distribution also carries the native modules Volatility depends on:
 `_lzma.pyd` (reads `.json.xz` ISF files), `_sqlite3.pyd` with `sqlite3.dll` (symbol

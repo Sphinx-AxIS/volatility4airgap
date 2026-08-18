@@ -77,9 +77,13 @@ can *hurt* on a USB-attached evidence drive where workers contend for the same r
 
 ## Building
 
-The Windows x64 bundle is built on macOS or Linux. No Windows machine is required —
-`volatility3` and its dependencies are either pure-Python or ship prebuilt `win_amd64`
-wheels, so nothing needs compiling.
+The build runs on Windows, macOS or Linux and always produces the same Windows x64
+bundle. It never compiles anything: `volatility3` and its dependencies are either
+pure-Python or ship prebuilt `win_amd64` wheels, and `pip` is asked for those explicitly
+via `--platform`. The host only downloads and arranges files, so it does not have to be
+— and does not have to match — the machine the bundle will run on.
+
+On Windows, substitute `py` for `python3`:
 
 ```
 python3 tools/build_portable.py                     # full bundle, ~875 MB with symbol pack
@@ -87,12 +91,15 @@ python3 tools/build_portable.py --lean              # ~75 MB, no symbol pack
 python3 tools/build_portable.py --check build/...   # verify a bundle against its manifest
 ```
 
+Two builds of the same inputs produce the same `payload_sha256` whichever host made
+them, so an approval authority can rebuild on their own platform and compare.
+
 Add `--vol-exe path/to/volatility3.exe` to include the official binary for the `exe`
 engine.
 
 The bundle contains an embedded CPython, so nothing is installed on the target and no
-administrator rights are needed. Two builds produce the same `payload_sha256`; the archive
-itself differs only by the build timestamp in `BUILD-MANIFEST.json`.
+administrator rights are needed. The archive differs between builds only by the build
+timestamp in `BUILD-MANIFEST.json`, which also records the host that made it.
 
 ## Tests
 

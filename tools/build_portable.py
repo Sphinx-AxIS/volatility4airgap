@@ -1,19 +1,32 @@
 #!/usr/bin/env python3
 """Assemble the portable Windows x64 bundle.
 
-Runs on macOS or Linux. No Windows machine is involved, and none is needed:
-volatility3 and pefile are pure-Python wheels, and every ``[full]`` extra ships a
-prebuilt ``win_amd64`` wheel, so nothing requires compilation. ``pip`` is asked for
-Windows artifacts explicitly via ``--platform``.
+Runs on any host — Windows, macOS or Linux — and produces the same bundle from
+each. Nothing is ever compiled: volatility3 and pefile are pure-Python wheels,
+every ``[full]`` extra ships a prebuilt ``win_amd64`` wheel, and ``pip`` is asked
+for those explicitly via ``--platform`` rather than being left to infer them from
+the host. The build only downloads and arranges files.
 
-That matters because the only Windows VM available here runs on ARM, where any
-interpreter-bundling tool would emit an ARM64 binary that will not run on a standard
-analyst workstation.
+Two consequences worth stating, because they are the reason for that design.
+
+A Windows host is not required. The Windows VM available here runs on ARM, so any
+tool that bundled the *host* interpreter would emit an ARM64 binary that cannot run
+on a standard analyst workstation. Fetching an explicit ``win_amd64`` interpreter
+and explicit ``win_amd64`` wheels sidesteps the host's own architecture entirely,
+which is also why building on an ARM Windows machine is fine.
+
+And a Windows host is not excluded. Anything host-shaped that pip leaves behind is
+stripped rather than assumed absent: ``__pycache__`` holds bytecode compiled by the
+host interpreter, and console-script wrappers land in ``bin`` on Unix or ``Scripts``
+on Windows, so both names are removed and the RECORD files pruned to match. That is
+what lets an approval authority rebuild on their own platform and compare
+``payload_sha256`` against ours.
 
 Every downloaded input is pinned and hashed, and BUILD-MANIFEST.json records what
-went in. That file is the evidence package for an approval authority.
+went in, including the host that built it. That file is the evidence package for an
+approval authority.
 
-Usage:
+Usage (on Windows, substitute ``py`` for ``python3``):
     python3 tools/build_portable.py                 # full bundle, ~820 MB
     python3 tools/build_portable.py --lean          # ~65 MB, no symbol pack
     python3 tools/build_portable.py --no-zip        # leave the folder, skip archiving
