@@ -41,13 +41,23 @@ def build(
     jobs: int,
     pagefiles: list | None = None,
     output_dir: Path,
+    dumps_dir: Path | None = None,
     plugin_records: list[dict],
     started_utc: str,
     finished_utc: str | None = None,
 ) -> dict:
     outputs = []
+    dump_files = []
     for path in sorted(p for p in output_dir.rglob("*") if p.is_file()):
         if path.name == FILENAME:
+            continue
+        # Carved files (windows.dumpfiles.DumpFiles under --all) are recorded as
+        # a count and total size, not hashed one by one: an --all run can carve
+        # thousands of multi-megabyte files, and hashing them inline would
+        # dominate the run and bloat this manifest. The plugin *output* that
+        # analyse verifies lives at the top level, not in dumps/.
+        if dumps_dir is not None and dumps_dir in path.parents:
+            dump_files.append(path)
             continue
         try:
             outputs.append(
@@ -59,6 +69,20 @@ def build(
             )
         except OSError:
             continue
+
+    dumps = None
+    if dump_files:
+        total = 0
+        for path in dump_files:
+            try:
+                total += path.stat().st_size
+            except OSError:
+                continue
+        dumps = {
+            "dir": dumps_dir.relative_to(output_dir).as_posix(),
+            "files": len(dump_files),
+            "total_bytes": total,
+        }
 
     succeeded = sum(1 for r in plugin_records if r["status"] == "ok")
 
@@ -97,6 +121,8 @@ def build(
             "failed": len(plugin_records) - succeeded,
         },
         "outputs": outputs,
+        # None unless a plugin carved files; see the loop above.
+        "dumps": dumps,
     }
 
 

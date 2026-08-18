@@ -36,6 +36,20 @@ class TriagePlan:
     timeout: float = 3600.0
     pagefiles: list[Path] = field(default_factory=list)
 
+    @property
+    def dumps_dir(self) -> Path:
+        """Where a dumping plugin's carved files land.
+
+        Volatility writes ``--dump`` output to the working directory of the child
+        process unless ``-o`` names somewhere else. Under ``--all`` that includes
+        ``windows.dumpfiles.DumpFiles``, which with no filter dumps every cached
+        file object in the image — potentially thousands of files, straight into
+        whatever directory the analyst launched ``v4ag`` from (the bundle root).
+        Pointing ``-o`` here keeps the tool's own directory clean and the dumps
+        with the run that produced them.
+        """
+        return self.output_dir / "dumps"
+
     def ensure_directories(self) -> None:
         """Create the directories a run writes into.
 
@@ -43,9 +57,11 @@ class TriagePlan:
         empty directory, so ``cache/`` and ``output/`` do not survive extraction —
         and Volatility fails with a bare ``FileNotFoundError`` on
         ``identifier.cache`` rather than anything an analyst could act on. Copying
-        a bundle with tools that skip empty directories has the same effect.
+        a bundle with tools that skip empty directories has the same effect. The
+        dumps directory must exist too: ``-o`` names it, and Volatility refuses to
+        start when that path is absent.
         """
-        for directory in (self.output_dir, self.cache_dir):
+        for directory in (self.output_dir, self.cache_dir, self.dumps_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
 
@@ -112,6 +128,7 @@ def build_tasks(plan: TriagePlan, engine: VolEngine) -> list[scheduler.Task]:
                         symbols_dir=plan.symbols_dir,
                         cache_dir=plan.cache_dir,
                         swap_files=plan.pagefiles,
+                        output_dir=plan.dumps_dir,
                     ),
                     stdout_path=output_path(plan.output_dir, plugin, fmt),
                     stderr_path=log_path(plan.output_dir, plugin, fmt),
@@ -430,6 +447,43 @@ def prune_empty_outputs(plan: TriagePlan, outcomes: list[PluginOutcome]) -> int:
     return removed
 
 
+def collect_dumps(plan: TriagePlan) -> list[Path]:
+    """The files a dumping plugin carved into the run's dumps folder.
+
+    Empty for a normal run: only ``windows.dumpfiles.DumpFiles`` (met under
+    ``--all``) dumps without being asked, and the curated set does not include
+    it. When it does run, this is how many files it produced and where.
+    """
+    if not plan.dumps_dir.is_dir():
+        return []
+    return sorted(p for p in plan.dumps_dir.rglob("*") if p.is_file())
+
+
+def dumps_total_bytes(paths: list[Path]) -> int:
+    total = 0
+    for path in paths:
+        try:
+            total += path.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def prune_empty_dumps(plan: TriagePlan) -> None:
+    """Remove the dumps folder when nothing dumped.
+
+    ``-o`` needs the directory to exist before the run, so it is created for
+    every run. A normal run leaves it empty, and an empty ``dumps/`` beside the
+    results is just clutter that reads as though something should be there.
+    """
+    dumps = plan.dumps_dir
+    if dumps.is_dir() and not any(dumps.iterdir()):
+        try:
+            dumps.rmdir()
+        except OSError:
+            pass
+
+
 def plugin_records(outcomes: list[PluginOutcome]) -> list[dict]:
     records = []
     for outcome in outcomes:
@@ -498,6 +552,7 @@ def write_manifest(
         jobs=plan.jobs,
         pagefiles=plan.pagefiles,
         output_dir=plan.output_dir,
+        dumps_dir=plan.dumps_dir,
         plugin_records=plugin_records(outcomes),
         started_utc=started_utc,
     )

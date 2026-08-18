@@ -85,10 +85,13 @@ class FakeEngine(VolEngine):
     name = "fake"
 
     def __init__(self, *, fail: set[str] | None = None, empty: set[str] | None = None,
-                 header_only: set[str] | None = None):
+                 header_only: set[str] | None = None, dumps: set[str] | None = None):
         self.fail = fail or set()
         self.empty = empty or set()
         self.header_only = header_only or set()
+        # Plugins that, like windows.dumpfiles.DumpFiles, carve a file into the
+        # -o directory in addition to their normal grid output.
+        self.dumps = dumps or set()
 
     def available(self) -> bool:
         return True
@@ -97,6 +100,19 @@ class FakeEngine(VolEngine):
         return [sys.executable, "-c", ""]
 
     def command(self, image, plugin, renderer, **kwargs) -> list[str]:
+        prelude = ""
+        if plugin in self.dumps:
+            # Volatility writes carved files to -o. If the tool did not pass one,
+            # output_dir is None and this would land in the child's CWD — which is
+            # exactly the bug the dumps folder exists to prevent.
+            out = kwargs.get("output_dir")
+            target = "None" if out is None else repr(str(out))
+            name = f"file.0x1.0x2.ImageSectionObject.{plugin}.img"
+            prelude = (
+                "import pathlib; _d = %s; "
+                "pathlib.Path(_d if _d else '.', %r).write_bytes(b'MZ\\x90\\x00'); "
+                % (target, name)
+            )
         if plugin in self.fail:
             code = "import sys; sys.stderr.write('plugin exploded'); raise SystemExit(1)"
         elif plugin in self.header_only:
@@ -107,7 +123,7 @@ class FakeEngine(VolEngine):
             code = "print('[{\"PID\": 4, \"Name\": \"System\"}]')"
         else:
             code = "print('PID,Name'); print('4,System')"
-        return [sys.executable, "-c", code]
+        return [sys.executable, "-c", prelude + code]
 
 
 def make_plan(tmp_path, plugin_names, formats=("csv", "json"), jobs=1):
@@ -705,3 +721,108 @@ class TestEmptyResultDiagnosis:
         results = scheduler.run_tasks(triage.build_tasks(plan, FakeEngine()))
         outcomes = triage.collect_outcomes(plan, results)
         assert triage.layer_warning(plan, outcomes) is None
+
+
+class TestDumpsAreConfined:
+    """A dumping plugin's carved files must land in the run, not the launch dir.
+
+    windows.dumpfiles.DumpFiles is met under --all and, with no filter, carves
+    every cached file object. Before this, triage passed no -o, so Volatility
+    wrote them to the child's working directory — the bundle root.
+    """
+
+    def test_every_task_points_dump_output_at_the_run(self, tmp_path) -> None:
+        from app.engine import LibraryEngine
+
+        plan = make_plan(tmp_path, ["windows.dumpfiles.DumpFiles"], formats=("json",))
+        (task,) = triage.build_tasks(plan, LibraryEngine(python=tmp_path / "py"))
+        argv = task.command
+        assert "-o" in argv
+        assert argv[argv.index("-o") + 1] == str(plan.dumps_dir)
+
+    def test_ensure_directories_creates_the_dumps_folder(self, tmp_path) -> None:
+        plan = make_plan(tmp_path, ["a.B"])
+        assert not plan.dumps_dir.exists()
+        plan.ensure_directories()
+        assert plan.dumps_dir.is_dir()
+
+    def test_carved_files_land_in_the_dumps_folder(self, tmp_path, monkeypatch) -> None:
+        # Run from an isolated cwd so "did anything leak to the launch dir?" is
+        # answerable without touching the real working directory.
+        launch = tmp_path / "launch"
+        launch.mkdir()
+        monkeypatch.chdir(launch)
+
+        plan = make_plan(tmp_path, ["windows.dumpfiles.DumpFiles"], formats=("json",))
+        plan.ensure_directories()
+
+        engine = FakeEngine(dumps={"windows.dumpfiles.DumpFiles"})
+        results = scheduler.run_tasks(triage.build_tasks(plan, engine))
+        assert all(r.ok for r in results)
+
+        carved = triage.collect_dumps(plan)
+        assert len(carved) == 1
+        assert carved[0].parent == plan.dumps_dir
+        assert carved[0].read_bytes().startswith(b"MZ")
+        # Nothing leaked into the launch directory.
+        assert list(launch.glob("file.0x*")) == []
+
+    def test_empty_dumps_folder_is_pruned(self, tmp_path) -> None:
+        plan = make_plan(tmp_path, ["windows.pslist.PsList"], formats=("json",))
+        plan.ensure_directories()
+        scheduler.run_tasks(triage.build_tasks(plan, FakeEngine()))
+
+        assert triage.collect_dumps(plan) == []
+        triage.prune_empty_dumps(plan)
+        assert not plan.dumps_dir.exists()
+
+    def test_a_populated_dumps_folder_survives_pruning(self, tmp_path) -> None:
+        plan = make_plan(tmp_path, ["windows.dumpfiles.DumpFiles"], formats=("json",))
+        plan.ensure_directories()
+        engine = FakeEngine(dumps={"windows.dumpfiles.DumpFiles"})
+        scheduler.run_tasks(triage.build_tasks(plan, engine))
+
+        triage.prune_empty_dumps(plan)  # must not remove a non-empty folder
+        assert plan.dumps_dir.is_dir()
+        assert triage.collect_dumps(plan)
+
+    def test_total_bytes_sums_the_carved_files(self, tmp_path) -> None:
+        plan = make_plan(tmp_path, ["a.B"])
+        plan.ensure_directories()
+        (plan.dumps_dir / "file.0x1.img").write_bytes(b"abcd")
+        (plan.dumps_dir / "file.0x2.img").write_bytes(b"ef")
+        assert triage.dumps_total_bytes(triage.collect_dumps(plan)) == 6
+
+    def test_manifest_summarises_dumps_without_hashing_them(self, tmp_path) -> None:
+        plan = make_plan(tmp_path, ["windows.dumpfiles.DumpFiles"], formats=("json",))
+        plan.image.parent.mkdir(parents=True, exist_ok=True)
+        plan.image.write_bytes(b"x")
+        plan.ensure_directories()
+
+        engine = FakeEngine(dumps={"windows.dumpfiles.DumpFiles"})
+        results = scheduler.run_tasks(triage.build_tasks(plan, engine))
+        outcomes = triage.collect_outcomes(plan, results)
+
+        path = triage.write_manifest(
+            plan, engine, outcomes, kernels=[], image_sha256=None,
+            started_utc=manifest.utc_now(),
+        )
+        document = json.loads(path.read_text())
+
+        # Carved files are counted, not listed among the hashed outputs.
+        assert document["dumps"] == {"dir": "dumps", "files": 1, "total_bytes": 4}
+        assert not any("dumps/" in o["file"] for o in document["outputs"])
+
+    def test_manifest_dumps_is_null_when_nothing_dumped(self, tmp_path) -> None:
+        plan = make_plan(tmp_path, ["windows.pslist.PsList"], formats=("json",))
+        plan.image.parent.mkdir(parents=True, exist_ok=True)
+        plan.image.write_bytes(b"x")
+        plan.ensure_directories()
+        results = scheduler.run_tasks(triage.build_tasks(plan, FakeEngine()))
+        outcomes = triage.collect_outcomes(plan, results)
+
+        path = triage.write_manifest(
+            plan, FakeEngine(), outcomes, kernels=[], image_sha256=None,
+            started_utc=manifest.utc_now(),
+        )
+        assert json.loads(path.read_text())["dumps"] is None

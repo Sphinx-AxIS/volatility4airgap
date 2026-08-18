@@ -334,11 +334,14 @@ def cmd_triage(args: argparse.Namespace) -> int:
 
     outcomes = triage.collect_outcomes(plan, results)
     pruned = triage.prune_empty_outputs(plan, outcomes)
+    dumps = triage.collect_dumps(plan)
 
     manifest_path = triage.write_manifest(
         plan, engine, outcomes,
         kernels=scan.kernels, image_sha256=scan.sha256, started_utc=started,
     )
+    if not dumps:
+        triage.prune_empty_dumps(plan)
 
     succeeded = [o for o in outcomes if o.ok]
     failed = [o for o in outcomes if not o.ok]
@@ -353,6 +356,15 @@ def cmd_triage(args: argparse.Namespace) -> int:
         print(f"\nWARNING: {warning}")
     if pruned:
         print(f"Removed {pruned} empty output file(s); logs kept.")
+    if dumps:
+        gb = triage.dumps_total_bytes(dumps) / 1e9
+        print(f"\n{len(dumps):,} file(s) dumped to {plan.dumps_dir} ({gb:.2f} GB).")
+        print("  A dumping plugin — windows.dumpfiles.DumpFiles in the --all set — "
+              "carves every")
+        print("  cached file object in the image. They are kept with the run, not "
+              "written to")
+        print("  the directory you launched from. Move or delete them once you have "
+              "what you need.")
     if failed:
         print("\nFailed:")
         for outcome in failed:

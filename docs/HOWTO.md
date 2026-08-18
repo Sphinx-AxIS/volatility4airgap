@@ -403,6 +403,15 @@ v4ag.bat triage --image E:\img.raw --plugins processes,windows.netscan.NetScan
 plugins need conditions your image will not meet. They are recorded in the manifest and
 their logs kept.
 
+`--all` also includes `windows.dumpfiles.DumpFiles`, which with no filter carves *every*
+cached file object in the image — often thousands of files, several gigabytes. These land
+in a `dumps\` subfolder of the output directory (never the directory you launched from),
+are summarised in the manifest as a count and total size rather than hashed one by one,
+and the run tells you how many there are and where. Move or delete them once you have what
+you need. To carve deliberately instead, name the plugin and target it — e.g.
+`--plugins windows.dumpfiles.DumpFiles` is still untargeted, so prefer running it by hand
+with `--filter <name>` or a specific `--physaddr`.
+
 ---
 
 ## Speed and `--jobs`
@@ -458,6 +467,8 @@ output\<image name>\
 ├─ windows.pstree.PsTree.csv
 ├─ ...
 ├─ run-manifest.json
+├─ dumps\                       only if a plugin carved files (see --all)
+│  └─ file.0x....ImageSectionObject.<name>.img
 └─ logs\
    ├─ windows.pslist.PsList.csv.log
    └─ ...
