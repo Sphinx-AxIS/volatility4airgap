@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import manifest, scheduler
-from .engine import VolEngine
+from .engine import VolEngine, render_command
 from .rules import SEVERITIES, Finding
 
 SCHEMA_VERSION = 1
@@ -389,18 +389,6 @@ def build_tasks(
 IMAGE_PLACEHOLDER = "<image>"
 
 
-def _quote(argument: str) -> str:
-    """Quote what the shell would otherwise split.
-
-    The placeholder is quoted even though it contains no space: the analyst
-    replaces it with a real image path, and evidence paths routinely contain
-    spaces. Quoting it here means substituting inside the quotes just works.
-    """
-    if " " in argument or argument.startswith("<"):
-        return f'"{argument}"'
-    return argument
-
-
 def render_suggestions(
     plan_: Plan,
     *,
@@ -443,7 +431,7 @@ def render_suggestions(
             output_dir=target,
             plugin_args=task.plugin_args,
         )
-        task.suggested_command = " ".join(_quote(a) for a in argv)
+        task.suggested_command = render_command(argv)
 
 
 def record_results(plan_: Plan, results: list[scheduler.TaskResult]) -> None:

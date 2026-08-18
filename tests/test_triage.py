@@ -327,6 +327,135 @@ class TestProbeDiagnosis:
         assert "may not be a supported" not in diagnosis
 
 
+#: What volatility3 2.28 writes to stderr when windows.strings.Strings is run
+#: without --strings-file. Captured from the bundled interpreter, not imagined:
+#: argparse refuses before Volatility validates anything, exit 2, stdout empty.
+STRINGS_STDERR = (
+    "usage: volrunner.py windows.strings.Strings [-h] [--pid [PID ...]]\n"
+    "                                            --strings-file STRINGS_FILE\n"
+    "volrunner.py windows.strings.Strings: error: the following arguments are "
+    "required: --strings-file\n"
+)
+
+
+class TestPluginNeedsAnArgument:
+    """A plugin that takes an input of its own fails under triage, which passes
+    none. That is the commonest failure under --all, and it used to be reported
+    as a bare exit code — or, through the requirement branch, as an image that
+    could not be identified. Neither sends the analyst anywhere useful."""
+
+    def _result(self, tmp_path, stderr_text, *, command=None, returncode=2):
+        task = scheduler.Task(
+            key="windows.strings.Strings:csv", label="strings", command=command or [],
+            stdout_path=tmp_path / "o", stderr_path=tmp_path / "e",
+        )
+        task.stderr_path.write_text(stderr_text, encoding="utf-8")
+        return scheduler.TaskResult(task, returncode=returncode)
+
+    def test_argparse_names_the_missing_option(self) -> None:
+        assert triage.missing_arguments(STRINGS_STDERR) == ["--strings-file"]
+
+    def test_several_missing_options_are_all_named(self) -> None:
+        text = "x: error: the following arguments are required: --a-file, --b-file\n"
+        assert triage.missing_arguments(text) == ["--a-file", "--b-file"]
+
+    def test_the_requirement_route_names_the_plugins_own_option(self) -> None:
+        """The other way the same fact surfaces, for a requirement the CLI could
+        not turn into an option: reported after the fact by config path."""
+        text = "Unable to validate the plugin requirements: ['plugins.Strings.strings_file']\n"
+        assert triage.missing_arguments(text) == ["--strings-file"]
+
+    def test_an_unsatisfied_layer_is_not_a_missing_argument(self) -> None:
+        """That is the image failing to identify — a different problem with a
+        different fix, and the one the requirement branch already explains."""
+        text = (
+            "Unable to validate the plugin requirements: "
+            "['plugins.PsList.kernel.layer_name', 'plugins.PsList.kernel.symbol_table_name']\n"
+        )
+        assert triage.missing_arguments(text) == []
+        text = "Unable to validate the plugin requirements: ['plugins.Info.primary']\n"
+        assert triage.missing_arguments(text) == []
+
+    def test_the_diagnosis_says_so_and_does_not_blame_the_image(self, tmp_path) -> None:
+        result = self._result(tmp_path, STRINGS_STDERR)
+        diagnosis = triage.failure_diagnosis(result)
+
+        assert "needs --strings-file" in diagnosis
+        assert "triage does not pass" in diagnosis
+        assert "identify the image" not in diagnosis
+
+    def test_the_by_hand_command_is_the_failed_one_plus_a_placeholder(
+        self, tmp_path
+    ) -> None:
+        """The exact argv that ran — image, symbols, cache, swap layers and all —
+        so only the plugin's own argument is left to fill in."""
+        argv = ["python.exe", "-m", "app.volrunner", "-q", "-f", r"E:\evidence\my image.raw",
+                "-r", "csv", "windows.strings.Strings"]
+        result = self._result(tmp_path, STRINGS_STDERR, command=argv)
+
+        command = triage.by_hand_command(result, ["--strings-file"])
+
+        assert command == (
+            'python.exe -m app.volrunner -q -f "E:\\evidence\\my image.raw" -r csv '
+            'windows.strings.Strings --strings-file "<STRINGS_FILE>"'
+        )
+
+    def test_the_note_carries_the_command_once_per_plugin(self, tmp_path) -> None:
+        """Both renderers failed the same way; saying it twice reads as two
+        problems."""
+        outcome = triage.PluginOutcome("windows.strings.Strings")
+        for fmt in ("csv", "json"):
+            (tmp_path / fmt).mkdir()
+            outcome.results[fmt] = self._result(
+                tmp_path / fmt, STRINGS_STDERR,
+                command=["vol", "-r", fmt, "windows.strings.Strings"],
+            )
+
+        note = triage.failure_note(outcome)
+
+        assert note.count("needs --strings-file") == 1
+        assert note.count("--strings-file \"<STRINGS_FILE>\"") == 1
+
+    def test_an_ordinary_failure_quotes_the_last_log_line(self, tmp_path) -> None:
+        """A traceback's last line is the exception; that beats 'exit 1'."""
+        result = self._result(
+            tmp_path, "Traceback (most recent call last):\n  ...\n"
+            "sqlite3.OperationalError: unable to open database file\n", returncode=1,
+        )
+        outcome = triage.PluginOutcome("windows.pslist.PsList", results={"csv": result})
+
+        assert triage.failure_note(outcome) == (
+            "sqlite3.OperationalError: unable to open database file"
+        )
+
+    def test_a_silent_failure_has_no_note(self, tmp_path) -> None:
+        result = self._result(tmp_path, "", returncode=1)
+        outcome = triage.PluginOutcome("windows.pslist.PsList", results={"csv": result})
+        assert triage.failure_note(outcome) == ""
+
+    def test_a_timeout_is_left_to_the_status_line(self, tmp_path) -> None:
+        result = self._result(tmp_path, "partial output", returncode=None)
+        result.timed_out = True
+        outcome = triage.PluginOutcome("windows.handles.Handles", results={"csv": result})
+        assert triage.failure_note(outcome) == ""
+
+    def test_the_manifest_records_the_diagnosis(self, tmp_path) -> None:
+        result = self._result(tmp_path, STRINGS_STDERR, command=["vol", "windows.strings.Strings"])
+        outcome = triage.PluginOutcome("windows.strings.Strings", results={"csv": result})
+
+        (record,) = triage.plugin_records([outcome])
+
+        assert record["status"] == "failed"
+        assert "needs --strings-file" in record["diagnosis"]
+        assert '--strings-file "<STRINGS_FILE>"' in record["diagnosis"]
+
+    def test_a_successful_plugin_has_no_diagnosis(self, tmp_path) -> None:
+        result = self._result(tmp_path, "", returncode=0)
+        outcome = triage.PluginOutcome("windows.pslist.PsList", results={"csv": result})
+        (record,) = triage.plugin_records([outcome])
+        assert record["diagnosis"] is None
+
+
 class TestProbeLogIsKept:
     """The probe log is the only record of why a probe failed.
 

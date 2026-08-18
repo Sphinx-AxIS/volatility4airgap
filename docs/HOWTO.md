@@ -529,6 +529,15 @@ the companion file beside the image with the same basename, or copy the image to
 extension to force the raw physical layer. The tool reports this explicitly when every
 plugin returns zero rows.
 
+**A plugin fails with `needs --something, which triage does not pass`**
+Nothing is missing from the bundle. Some plugins take an input of their own —
+`windows.strings.Strings` wants a `--strings-file` produced beforehand by the `strings`
+utility, `windows.vadregexscan.VadRegExScan` wants a `--pattern` — and Volatility refuses
+to start them without it. Triage passes no per-plugin arguments, which is why none of these is in
+the curated set; you meet them under `--all` or by naming one. The failure line prints
+the exact command to run it by hand with a placeholder for the missing argument, and
+`run-manifest.json` records the same under `diagnosis`.
+
 **Everything fails after copying symbols across**
 Check the folder landed in the right place. The tool expects
 `symbols\windows\<pdb name>\<GUID>-<age>.json.xz`. `v4ag.bat verify symbol_request.json`

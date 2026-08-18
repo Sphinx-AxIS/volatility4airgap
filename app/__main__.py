@@ -357,6 +357,13 @@ def cmd_triage(args: argparse.Namespace) -> int:
         print("\nFailed:")
         for outcome in failed:
             print(f"  {outcome.plugin}: {outcome.status()}")
+            # Why, in the words that name the fix — so a plugin that merely
+            # wanted an argument does not read like a broken image, and the
+            # analyst is not sent to the log to find that out.
+            note = triage.failure_note(outcome)
+            if note:
+                for line in note.splitlines():
+                    print(f"    {line}")
         print(f"\nPer-plugin logs: {output_dir / 'logs'}")
     print(f"\nManifest {manifest_path}")
 

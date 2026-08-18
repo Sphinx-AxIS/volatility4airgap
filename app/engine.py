@@ -27,6 +27,19 @@ class EngineUnavailable(RuntimeError):
     pass
 
 
+def render_command(argv: list[str]) -> str:
+    """An argv as one line the analyst can paste into a shell.
+
+    Quotes what the shell would otherwise split. A ``<placeholder>`` is quoted
+    even though it contains no space: the analyst replaces it with a real path,
+    and evidence paths routinely contain spaces, so substituting inside the
+    quotes just works.
+    """
+    return " ".join(
+        f'"{a}"' if " " in a or a.startswith("<") else a for a in argv
+    )
+
+
 class VolEngine(ABC):
     name: str
 

@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import manifest, plugins as plugin_catalog, scheduler
-from .engine import VolEngine
+from .engine import VolEngine, render_command
 from .symbols import KernelPdb
 
 
@@ -157,7 +157,7 @@ def run_probe(plan: TriagePlan, engine: VolEngine, *, log=print) -> scheduler.Ta
 #: therefore reports the symptom and throws away the answer, which is precisely what a
 #: stuck analyst needs. Each entry maps a fragment of Volatility's own message to an
 #: explanation that names the fix.
-_PROBE_CAUSES: tuple[tuple[str, str], ...] = (
+_KNOWN_CAUSES: tuple[tuple[str, str], ...] = (
     (
         "no metadata file found alongside vmem",
         "This VMEM has no VMSS/VMSN metadata file that Volatility could pair with it.\n"
@@ -178,25 +178,89 @@ _PROBE_CAUSES: tuple[tuple[str, str], ...] = (
 )
 
 
-def probe_diagnosis(result: scheduler.TaskResult) -> str:
-    """Turn a failed probe into something actionable."""
-    if result.timed_out:
-        return "The probe timed out. The image may be very large or on slow media."
+#: argparse's refusal, when a plugin declares a required option and none was
+#: given: "error: the following arguments are required: --strings-file". This is
+#: how a plugin that takes an input of its own fails under triage, which passes
+#: none — and it is the commonest failure under --all, where every such plugin
+#: is run.
+_ARGS_REQUIRED = re.compile(r"the following arguments are required:\s*(.+)$", re.I | re.M)
 
-    text = ""
+#: The other route to the same fact: a requirement the CLI could not turn into
+#: an option, reported after the fact as "Unable to validate the plugin
+#: requirements: ['plugins.Strings.strings_file']".
+_UNSATISFIED = re.compile(r"plugin requirements:\s*\[([^\]]*)\]", re.I)
+
+#: Requirement path components that belong to the image and its symbols rather
+#: than to the plugin. An unsatisfied one of these means Volatility could not
+#: build the kernel layer; anything else names an argument the plugin wanted.
+_LAYER_COMPONENTS = frozenset(
+    {"kernel", "primary", "memory_layer", "layer_name", "nt_symbols",
+     "symbol_table_name"}
+)
+
+
+def missing_arguments(log_text: str) -> list[str]:
+    """The plugin's own options a failed run went without, as ``--flags``.
+
+    Empty when the failure was something else — including an unsatisfied
+    requirement that belongs to the image, which is a different problem with a
+    different fix.
+    """
+    found: list[str] = []
+    for match in _ARGS_REQUIRED.finditer(log_text):
+        for flag in match.group(1).split(","):
+            flag = flag.strip()
+            if flag.startswith("-") and flag not in found:
+                found.append(flag)
+    if found:
+        return found
+
+    match = _UNSATISFIED.search(log_text)
+    if match:
+        for raw in match.group(1).split(","):
+            path = raw.strip().strip("'\"")
+            parts = path.split(".")
+            if not parts or set(parts) & _LAYER_COMPONENTS:
+                continue
+            flag = "--" + parts[-1].replace("_", "-")
+            if flag not in found:
+                found.append(flag)
+    return found
+
+
+def _read_log(result: scheduler.TaskResult) -> str:
     try:
-        text = result.task.stderr_path.read_text(encoding="utf-8", errors="replace")
+        return result.task.stderr_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        pass
+        return ""
 
+
+def failure_diagnosis(result: scheduler.TaskResult) -> str:
+    """Why a Volatility invocation failed, in words that name the fix.
+
+    Shared by the probe and by every plugin in the main run. Returns ``""`` when
+    the log holds nothing recognisable and nothing worth quoting.
+    """
+    text = _read_log(result)
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     detail = lines[-1] if lines else ""
 
     # A named root cause beats the generic consequence on the last line.
     whole_log = text.lower()
-    for needle, explanation in _PROBE_CAUSES:
+    for needle, explanation in _KNOWN_CAUSES:
         if needle in whole_log:
             return explanation
+
+    # A plugin that wants an argument triage does not pass. Checked before the
+    # requirement branch below, which would otherwise read the same failure as
+    # an unidentifiable image and send the analyst back to the evidence.
+    missing = missing_arguments(text)
+    if missing:
+        flags = ", ".join(missing)
+        return (
+            f"needs {flags}, which triage does not pass. The plugin takes an "
+            f"input of its own; run it by hand with that argument."
+        )
 
     lowered = detail.lower()
 
@@ -220,7 +284,48 @@ def probe_diagnosis(result: scheduler.TaskResult) -> str:
             "Volatility could not load symbols. Run 'symbols' to confirm what is "
             f"needed.\n  {detail}"
         )
-    return detail or "no diagnostic output"
+    return detail
+
+
+def probe_diagnosis(result: scheduler.TaskResult) -> str:
+    """Turn a failed probe into something actionable."""
+    if result.timed_out:
+        return "The probe timed out. The image may be very large or on slow media."
+    return failure_diagnosis(result) or "no diagnostic output"
+
+
+def by_hand_command(result: scheduler.TaskResult, missing: list[str]) -> str:
+    """The failed invocation again, with a placeholder for each missing option.
+
+    The exact argv that ran, so it carries the image, symbols, cache and swap
+    layers triage used; only the plugin's own argument is left for the analyst
+    to fill in. It writes to the console where triage wrote to a file, so a
+    redirection is the analyst's to add.
+    """
+    argv = list(result.task.command)
+    for flag in missing:
+        argv += [flag, f"<{flag.lstrip('-').upper().replace('-', '_')}>"]
+    return render_command(argv)
+
+
+def failure_note(outcome: PluginOutcome) -> str:
+    """What to print under a failed plugin's status line, or ``""``.
+
+    One diagnosis per plugin, not per format: both renderers ran the same
+    invocation and failed the same way, and saying it twice reads as two
+    problems. Timeouts are left to the status line, which already says so.
+    """
+    failed = [r for r in outcome.results.values() if not r.ok and not r.timed_out]
+    if not failed:
+        return ""
+    result = failed[0]
+    diagnosis = failure_diagnosis(result)
+    if not diagnosis:
+        return ""
+    missing = missing_arguments(_read_log(result))
+    if missing:
+        diagnosis += f"\n  {by_hand_command(result, missing)}"
+    return diagnosis
 
 
 def collect_outcomes(
@@ -306,6 +411,9 @@ def plugin_records(outcomes: list[PluginOutcome]) -> list[dict]:
                 "plugin": outcome.plugin,
                 "status": "ok" if outcome.ok else "failed",
                 "detail": None if outcome.ok else outcome.status(),
+                # The same words the console showed, so the manifest can be read
+                # later without the console and without opening the log.
+                "diagnosis": None if outcome.ok else (failure_note(outcome) or None),
                 "rows": outcome.rows,
                 "seconds": round(outcome.duration, 2),
                 "formats": {
