@@ -77,3 +77,6 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local one-off helper (throwaway; strings-map does this in-tool now)
+/tools/clean_csv.py
