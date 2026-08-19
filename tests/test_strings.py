@@ -883,3 +883,44 @@ class TestStringsMapCommand:
                      "--strings-file", str(strings_file)]) == 2
         assert main(["strings-map", "--image", str(image), "--out", str(out),
                      "--strings-file", str(tmp_path / "no.strings")]) == 2
+
+
+class TestCleanAttributionCsv:
+    def test_each_record_becomes_one_greppable_line(self) -> None:
+        import io
+
+        # what the plugin's CSV looks like: a leading TreeDepth column, and every
+        # String field quoted with the trailing newline the plugin left on it
+        raw = io.StringIO(
+            "TreeDepth,String,Physical Address,Result\n"
+            '0,"rechapman.duckdns.org\n",0x1234,"Process 4180"\n'
+            '0,"a,b with comma\n",0x9,"Process 1, Process 2"\n'
+        )
+        out = io.StringIO()
+        rows = S.clean_attribution_csv(raw, out)
+        lines = out.getvalue().splitlines()
+        assert rows == 3  # header plus two records
+        # TreeDepth dropped, embedded newline gone
+        assert lines[0] == "String,Physical Address,Result"
+        assert lines[1] == "rechapman.duckdns.org,0x1234,Process 4180"
+        # a field with a comma stays quoted, but on ONE physical line
+        assert lines[2] == '"a,b with comma",0x9,"Process 1, Process 2"'
+        assert len(lines) == 3  # no record split across two lines
+
+    def test_strings_map_output_has_no_embedded_newlines(
+        self, tmp_path, image, fake_engine, monkeypatch
+    ) -> None:
+        # the plugin's rows carry the trailing newline; the command must tidy them
+        monkeypatch.setattr(S, "WRAP", WRAP)
+        strings_file = tmp_path / "true.strings"
+        strings_file.write_bytes(b"100:low\n%d:high\n" % (2 * WRAP + 100))
+        fake_engine.rows = [
+            {"String": "needle\n", "Physical Address": 1, "Result": "Process 7, Process 8"},
+        ]
+        out = tmp_path / "r"
+        assert main(["strings-map", "--image", str(image), "--strings-file",
+                     str(strings_file), "--out", str(out)]) == 0
+        csv_path = out / "strings" / "strings-map.csv"
+        assert csv_path.is_file()
+        # the raw temp is cleaned up
+        assert not (out / "strings" / "strings-map.csv.raw").exists()

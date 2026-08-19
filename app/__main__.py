@@ -1376,6 +1376,7 @@ def cmd_strings_map(args: argparse.Namespace) -> int:
         return 2
 
     output = strings_dir / "strings-map.csv"
+    raw = strings_dir / "strings-map.csv.raw"
     if output.exists() and not args.overwrite:
         print(f"error: {output} already exists "
               f"({output.stat().st_size / 1e9:.2f} GB). Pass --overwrite to replace it.",
@@ -1417,6 +1418,8 @@ def cmd_strings_map(args: argparse.Namespace) -> int:
     cache_dir = BUNDLE_ROOT / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     strings_dir.mkdir(parents=True, exist_ok=True)
+    if raw.exists():  # a temp left by an interrupted earlier run
+        raw.unlink()
 
     plugin_args = ["--strings-file", str(strings_file)]
     if args.pid:
@@ -1430,7 +1433,7 @@ def cmd_strings_map(args: argparse.Namespace) -> int:
             image, strings_mod.PLUGIN, "csv",
             symbols_dir=symbols_dir, cache_dir=cache_dir, plugin_args=plugin_args,
         ),
-        stdout_path=output,
+        stdout_path=raw,
         stderr_path=strings_dir / "logs" / "strings-map.csv.log",
     )
     print(f"\nAttributing all {probe.lines:,} line(s) with {strings_mod.PLUGIN} "
@@ -1459,10 +1462,27 @@ def cmd_strings_map(args: argparse.Namespace) -> int:
 
     code = 0
     if result.ok:
-        # The CSV is huge and written by the subprocess, so it is recorded by size,
-        # not hashed: a whole-image run makes tens of millions of rows, and reading
-        # them all back to hash would add minutes for little custody value on a
-        # derived, greppable artifact.
+        # The plugin folds each strings-file line's trailing newline into the String
+        # column, so the renderer quotes every String field with an embedded newline
+        # — each record then spans two physical lines and findstr/grep split it.
+        # Rewrite it, quote-aware, to one line per record. A second streaming pass,
+        # so it briefly needs room for both files.
+        print("Tidying the CSV so each record is one greppable line...")
+        rows = None
+        try:
+            with open(raw, "r", newline="", encoding="utf-8", errors="replace") as src, \
+                    open(output, "w", newline="", encoding="utf-8") as dst:
+                rows = strings_mod.clean_attribution_csv(src, dst)
+            raw.unlink()
+        except Exception as exc:  # noqa: BLE001 - never lose a finished run over tidy-up
+            print(f"  warning: could not tidy the CSV ({exc}); keeping the plugin's raw "
+                  "output, whose String column has embedded newlines.", file=sys.stderr)
+            if raw.exists():
+                raw.replace(output)
+        record["rows"] = rows
+        # Recorded by size, not hashed: a whole-image run makes tens of millions of
+        # rows, and hashing a derived, greppable artifact adds minutes for little
+        # custody value.
         size = output.stat().st_size if output.exists() else 0
         record["output_size"] = size
         print(f"\nWrote {output} ({size / 1e9:.2f} GB) in {result.duration / 60:.0f} min")
@@ -1476,6 +1496,8 @@ def cmd_strings_map(args: argparse.Namespace) -> int:
             for line in diagnosis.splitlines():
                 print(f"    {line}")
         print(f"  Log {task.stderr_path}")
+        if raw.exists():
+            raw.unlink()
         code = 1
 
     manifest_path = manifest.write(strings_dir, record, filename="strings-map.json")

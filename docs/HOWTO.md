@@ -333,9 +333,12 @@ Because it attributes the file in one pass, it does **no** per-line offset repai
 needs a true-offset file, which is what `strings` writes (or GNU `strings -td`). A wrapped
 Sysinternals `-o` file is refused (exit code 5): its offsets would place every string past
 4 GiB on the wrong process. Regenerate with `strings`, or pass `--force` to attribute it
-exactly as written if you know the offsets are sound. The CSV is recorded in
-`strings-map.json` by size rather than digest — a whole-image run makes tens of millions of
-rows, and it is a derived, greppable artifact, not evidence.
+exactly as written if you know the offsets are sound. Each record is one physical line —
+the plugin folds the source line's trailing newline into the String column and the CSV
+renderer would otherwise leave it there, splitting every record across two lines, so the
+command flattens it — which is what lets `findstr`/`grep` work directly. The CSV is recorded
+in `strings-map.json` by size rather than digest — a whole-image run makes tens of millions
+of rows, and it is a derived, greppable artifact, not evidence.
 
 Expect the run to hold the reverse map (tens of GB) plus the whole strings file in memory at
 once; it is built for a host with the RAM to spare. When you have a defined IOC list rather

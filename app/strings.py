@@ -25,6 +25,7 @@ premise the plugin itself rests on.
 from __future__ import annotations
 
 import codecs
+import csv
 import re
 import time
 from dataclasses import dataclass, field
@@ -542,6 +543,33 @@ def probe_offsets(path: Path, *, block_size: int = 16 << 20) -> OffsetProbe:
             if offset is not None and offset > max_offset:
                 max_offset = offset
     return OffsetProbe(lines=lines, max_offset=max_offset)
+
+
+def clean_attribution_csv(src, dst) -> int:
+    """Rewrite a windows.strings.Strings CSV so every record is one physical line.
+
+    The plugin's line regex folds each strings-file line's trailing newline into
+    the String column, so the CSV renderer quotes every String field with an
+    embedded newline. That is valid CSV, but it makes each record span two physical
+    lines, and line tools (findstr, grep) then split mid-record. Parse with the csv
+    module, which is quote-aware, re-emit with those newlines flattened to a space,
+    and drop the renderer's leading always-zero ``TreeDepth`` column. ``src`` and
+    ``dst`` are open text file objects; returns the number of rows written.
+    """
+    # A carved string can be far longer than the csv module's default field cap;
+    # 2**31-1 is the largest a Windows build accepts and dwarfs any real line.
+    csv.field_size_limit(2**31 - 1)
+    reader = csv.reader(src)
+    writer = csv.writer(dst, lineterminator="\n")
+    rows = 0
+    drop_first = False
+    for index, row in enumerate(reader):
+        cells = [cell.replace("\r", " ").replace("\n", " ").rstrip() for cell in row]
+        if index == 0 and cells[:1] == ["TreeDepth"]:
+            drop_first = True
+        writer.writerow(cells[1:] if drop_first else cells)
+        rows += 1
+    return rows
 
 
 def _widen(probe: bytes) -> bytes:
